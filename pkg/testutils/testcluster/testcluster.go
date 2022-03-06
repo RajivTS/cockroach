@@ -744,6 +744,13 @@ func (tc *TestCluster) WaitForVoters(
 // respective replica has caught up with the config change).
 //
 // targets are replication target for change replica.
+//
+// TODO(tbg): it seems silly that most callers pass `waitForVoter==false` even
+// when they are adding a voter, and instead well over a dozen tests then go and
+// call `.WaitForVoter` instead. It is very rare for a test to want to add a
+// voter but not wait for this voter to show up on the target replica (perhaps
+// when some strange error is injected) so the rare test should have to do the
+// extra work instead.
 func (tc *TestCluster) waitForNewReplicas(
 	startKey roachpb.Key, waitForVoter bool, targets ...roachpb.ReplicationTarget,
 ) error {
@@ -888,24 +895,26 @@ func (tc *TestCluster) TransferRangeLeaseOrFatal(
 	t testing.TB, rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
 ) {
 	if err := tc.TransferRangeLease(rangeDesc, dest); err != nil {
-		t.Fatalf(`could transfer lease for range %s error is %+v`, rangeDesc, err)
+		t.Fatalf(`could not transfer lease for range %s error is %+v`, rangeDesc, err)
 	}
 }
 
-// RemoveLeaseHolderOrFatal is a convenience version of TransferRangeLease and RemoveVoter
+// RemoveLeaseHolderOrFatal is a convenience wrapper around RemoveVoter
 func (tc *TestCluster) RemoveLeaseHolderOrFatal(
-	t testing.TB,
-	rangeDesc roachpb.RangeDescriptor,
-	src roachpb.ReplicationTarget,
-	dest roachpb.ReplicationTarget,
+	t testing.TB, rangeDesc roachpb.RangeDescriptor, src roachpb.ReplicationTarget,
 ) {
 	testutils.SucceedsSoon(t, func() error {
-		if err := tc.TransferRangeLease(rangeDesc, dest); err != nil {
-			return err
-		}
 		if _, err := tc.RemoveVoters(rangeDesc.StartKey.AsRawKey(), src); err != nil {
-			if strings.Contains(err.Error(), "to remove self (leaseholder)") {
+			if strings.Contains(err.Error(), "to remove self (leaseholder)") ||
+				strings.Contains(err.Error(), "leaseholder moved") ||
+				strings.Contains(err.Error(), "isn't the Raft leader") {
 				return err
+			} else if strings.Contains(err.Error(),
+				"trying to remove a replica that doesn't exist") {
+				// It's possible that on leaseholder initiates the removal but another one completes it.
+				// The first attempt throws an error because the leaseholder moves, the second attempt
+				// fails with the exception that the voter doesn't exist, which is expected.
+				return nil
 			}
 			t.Fatal(err)
 		}

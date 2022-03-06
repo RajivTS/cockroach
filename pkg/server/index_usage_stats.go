@@ -12,7 +12,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -94,7 +93,7 @@ func (s *statusServer) IndexUsageStatistics(
 	// need to aggregate all stats before returning. Returning a partial result
 	// yields an incorrect result.
 	if err := s.iterateNodes(ctx,
-		fmt.Sprintf("requesting index usage stats for node %s", req.NodeID),
+		"requesting index usage stats",
 		dialFn, fetchIndexUsageStats, aggFn, errFn); err != nil {
 		return nil, err
 	}
@@ -177,7 +176,7 @@ func (s *statusServer) ResetIndexUsageStats(
 	}
 
 	if err := s.iterateNodes(ctx,
-		fmt.Sprintf("Resetting index usage stats for node %s", req.NodeID),
+		"Resetting index usage stats",
 		dialFn, resetIndexUsageStats, aggFn, errFn); err != nil {
 		return nil, err
 	}
@@ -230,7 +229,8 @@ func getTableIndexUsageStats(
 			ti.index_type,
 			total_reads,
 			last_read,
-			indexdef
+			indexdef,
+			ti.created_at
 		FROM crdb_internal.index_usage_statistics AS us
   	JOIN crdb_internal.table_indexes AS ti ON us.index_id = ti.index_id 
 		AND us.table_id = ti.descriptor_id
@@ -241,7 +241,7 @@ func getTableIndexUsageStats(
 		tableID,
 	)
 
-	const expectedNumDatums = 6
+	const expectedNumDatums = 7
 
 	it, err := ie.QueryIteratorEx(ctx, "index-usage-stats", nil,
 		sessiondata.InternalExecutorOverride{
@@ -279,6 +279,11 @@ func getTableIndexUsageStats(
 			lastRead = tree.MustBeDTimestampTZ(row[4]).Time
 		}
 		createStmt := tree.MustBeDString(row[5])
+		var createdAt *time.Time
+		if row[6] != tree.DNull {
+			ts := tree.MustBeDTimestamp(row[6])
+			createdAt = &ts.Time
+		}
 
 		if err != nil {
 			return nil, err
@@ -298,6 +303,7 @@ func getTableIndexUsageStats(
 			IndexName:       string(indexName),
 			IndexType:       string(indexType),
 			CreateStatement: string(createStmt),
+			CreatedAt:       createdAt,
 		}
 
 		idxUsageStats = append(idxUsageStats, idxStatsRow)

@@ -9,12 +9,15 @@
 package backupccl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/bulk"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -32,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	gogotypes "github.com/gogo/protobuf/types"
 )
 
@@ -51,9 +55,6 @@ type restoreDataProcessor struct {
 	// is updated, the job should be PAUSEd and RESUMEd for the new setting to
 	// take effect.
 	numWorkers int
-	// flushBytes is the maximum buffer size used when creating SSTs to flush. It
-	// remains constant over the lifetime of the processor.
-	flushBytes int64
 
 	// phaseGroup manages the phases of the restore:
 	// 1) reading entries from the input
@@ -72,16 +73,34 @@ type restoreDataProcessor struct {
 	progCh chan RestoreProgress
 }
 
-var _ execinfra.Processor = &restoreDataProcessor{}
-var _ execinfra.RowSource = &restoreDataProcessor{}
+var (
+	_ execinfra.Processor = &restoreDataProcessor{}
+	_ execinfra.RowSource = &restoreDataProcessor{}
+)
 
 const restoreDataProcName = "restoreDataProcessor"
 
 const maxConcurrentRestoreWorkers = 32
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 var defaultNumWorkers = util.ConstantWithMetamorphicTestRange(
 	"restore-worker-concurrency",
-	1, /* defaultValue */
+	func() int {
+		// On low-CPU instances, a default value may still allow concurrent restore
+		// workers to tie up all cores so cap default value at cores-1 when the
+		// default value is higher.
+		restoreWorkerCores := runtime.GOMAXPROCS(0) - 1
+		if restoreWorkerCores < 1 {
+			restoreWorkerCores = 1
+		}
+		return min(4, restoreWorkerCores)
+	}(), /* defaultValue */
 	1, /* metamorphic min */
 	8, /* metamorphic max */
 )
@@ -105,7 +124,7 @@ var restoreAtNow = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"bulkio.restore_at_current_time.enabled",
 	"write restored data at the current timestamp",
-	false,
+	true,
 )
 
 func newRestoreDataProcessor(
@@ -126,7 +145,6 @@ func newRestoreDataProcessor(
 		progCh:     make(chan RestoreProgress, maxConcurrentRestoreWorkers),
 		metaCh:     make(chan *execinfrapb.ProducerMetadata, 1),
 		numWorkers: int(numRestoreWorkers.Get(sv)),
-		flushBytes: storageccl.MaxIngestBatchSize(flowCtx.Cfg.Settings),
 	}
 
 	if err := rd.Init(rd, post, restoreDataOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
@@ -144,6 +162,7 @@ func newRestoreDataProcessor(
 
 // Start is part of the RowSource interface.
 func (rd *restoreDataProcessor) Start(ctx context.Context) {
+	ctx = logtags.AddTag(ctx, "job", rd.spec.JobID)
 	ctx = rd.StartInternal(ctx, restoreDataProcName)
 	rd.input.Start(ctx)
 
@@ -153,6 +172,7 @@ func (rd *restoreDataProcessor) Start(ctx context.Context) {
 		_ = rd.phaseGroup.Wait()
 	}
 	rd.phaseGroup = ctxgroup.WithContext(ctx)
+	log.Infof(ctx, "starting restore data")
 
 	entries := make(chan execinfrapb.RestoreSpanEntry, rd.numWorkers)
 	rd.sstCh = make(chan mergedSST, rd.numWorkers)
@@ -357,7 +377,6 @@ func (rd *restoreDataProcessor) runRestoreWorkers(ctx context.Context, ssts chan
 
 				return done, nil
 			}()
-
 			if err != nil {
 				return err
 			}
@@ -387,6 +406,16 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 		)
 	}
 
+	// If the system tenant is restoring a guest tenant span, we don't want to
+	// forward all the restored data to now, as there may be importing tables in
+	// that span, that depend on the difference in timestamps on restored existing
+	// vs importing keys to rollback.
+	if writeAtBatchTS && kr.fromSystemTenant &&
+		(bytes.HasPrefix(entry.Span.Key, keys.TenantPrefix) || bytes.HasPrefix(entry.Span.EndKey, keys.TenantPrefix)) {
+		log.Warningf(ctx, "restoring span %s at its original timestamps because it is a tenant span", entry.Span)
+		writeAtBatchTS = false
+	}
+
 	// "disallowing" shadowing of anything older than logical=1 is i.e. allow all
 	// shadowing. We must allow shadowing in case the RESTORE has to retry any
 	// ingestions, but setting a (permissive) disallow like this serves to force
@@ -398,7 +427,6 @@ func (rd *restoreDataProcessor) processRestoreSpanEntry(
 	batcher, err := bulk.MakeSSTBatcher(ctx,
 		db,
 		evalCtx.Settings,
-		func() int64 { return rd.flushBytes },
 		disallowShadowingBelow,
 		writeAtBatchTS,
 	)

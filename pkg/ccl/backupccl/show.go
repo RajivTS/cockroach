@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -163,6 +164,54 @@ func (m manifestInfoReader) showBackup(
 	return nil
 }
 
+type metadataSSTInfoReader struct{}
+
+var _ backupInfoReader = manifestInfoReader{}
+
+func (m metadataSSTInfoReader) header() colinfo.ResultColumns {
+	return colinfo.ResultColumns{
+		{Name: "file", Typ: types.String},
+		{Name: "key", Typ: types.String},
+		{Name: "detail", Typ: types.Jsonb},
+	}
+}
+
+func (m metadataSSTInfoReader) showBackup(
+	ctx context.Context,
+	mem *mon.BoundAccount,
+	store cloud.ExternalStorage,
+	incStore cloud.ExternalStorage,
+	enc *jobspb.BackupEncryptionOptions,
+	incPaths []string,
+	resultsCh chan<- tree.Datums,
+) error {
+	filename := metadataSSTName
+	push := func(_, readable string, value json.JSON) error {
+		val := tree.DNull
+		if value != nil {
+			val = tree.NewDJSON(value)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case resultsCh <- []tree.Datum{tree.NewDString(filename), tree.NewDString(readable), val}:
+			return nil
+		}
+	}
+
+	if err := DebugDumpMetadataSST(ctx, store, filename, enc, push); err != nil {
+		return err
+	}
+
+	for _, i := range incPaths {
+		filename = strings.TrimSuffix(i, backupManifestName) + metadataSSTName
+		if err := DebugDumpMetadataSST(ctx, incStore, filename, enc, push); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // showBackupPlanHook implements PlanHookFn.
 func showBackupPlanHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
@@ -190,12 +239,13 @@ func showBackupPlanHook(
 	}
 
 	expected := map[string]sql.KVStringOptValidate{
-		backupOptEncPassphrase:  sql.KVStringOptRequireValue,
-		backupOptEncKMS:         sql.KVStringOptRequireValue,
-		backupOptWithPrivileges: sql.KVStringOptRequireNoValue,
-		backupOptAsJSON:         sql.KVStringOptRequireNoValue,
-		backupOptWithDebugIDs:   sql.KVStringOptRequireNoValue,
-		backupOptIncStorage:     sql.KVStringOptRequireValue,
+		backupOptEncPassphrase:    sql.KVStringOptRequireValue,
+		backupOptEncKMS:           sql.KVStringOptRequireValue,
+		backupOptWithPrivileges:   sql.KVStringOptRequireNoValue,
+		backupOptAsJSON:           sql.KVStringOptRequireNoValue,
+		backupOptWithDebugIDs:     sql.KVStringOptRequireNoValue,
+		backupOptIncStorage:       sql.KVStringOptRequireValue,
+		backupOptDebugMetadataSST: sql.KVStringOptRequireNoValue,
 	}
 	optsFn, err := p.TypeAsStringOpts(ctx, backup.Options, expected)
 	if err != nil {
@@ -211,18 +261,22 @@ func showBackupPlanHook(
 	}
 
 	var infoReader backupInfoReader
-	var shower backupShower
-	switch backup.Details {
-	case tree.BackupRangeDetails:
-		shower = backupShowerRanges
-	case tree.BackupFileDetails:
-		shower = backupShowerFiles
-	case tree.BackupManifestAsJSON:
-		shower = jsonShower
-	default:
-		shower = backupShowerDefault(ctx, p, backup.ShouldIncludeSchemas, opts)
+	if _, dumpSST := opts[backupOptDebugMetadataSST]; dumpSST {
+		infoReader = metadataSSTInfoReader{}
+	} else {
+		var shower backupShower
+		switch backup.Details {
+		case tree.BackupRangeDetails:
+			shower = backupShowerRanges
+		case tree.BackupFileDetails:
+			shower = backupShowerFiles
+		case tree.BackupManifestAsJSON:
+			shower = jsonShower
+		default:
+			shower = backupShowerDefault(ctx, p, backup.ShouldIncludeSchemas, opts)
+		}
+		infoReader = manifestInfoReader{shower}
 	}
-	infoReader = manifestInfoReader{shower}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
 		// TODO(dan): Move this span into sql.
@@ -275,9 +329,11 @@ func showBackupPlanHook(
 			if err != nil {
 				return err
 			}
-			encryptionKey := storageccl.GenerateKey([]byte(passphrase), opts.Salt)
-			encryption = &jobspb.BackupEncryptionOptions{Mode: jobspb.EncryptionMode_Passphrase,
-				Key: encryptionKey}
+			encryptionKey := storageccl.GenerateKey([]byte(passphrase), opts[0].Salt)
+			encryption = &jobspb.BackupEncryptionOptions{
+				Mode: jobspb.EncryptionMode_Passphrase,
+				Key:  encryptionKey,
+			}
 		} else if kms, ok := opts[backupOptEncKMS]; ok {
 			opts, err := readEncryptionOptions(ctx, store)
 			if err != nil {
@@ -285,14 +341,21 @@ func showBackupPlanHook(
 			}
 
 			env := &backupKMSEnv{p.ExecCfg().Settings, &p.ExecCfg().ExternalIODirConfig}
-			defaultKMSInfo, err := validateKMSURIsAgainstFullBackup([]string{kms},
-				newEncryptedDataKeyMapFromProtoMap(opts.EncryptedDataKeyByKMSMasterKeyID), env)
+			var defaultKMSInfo *jobspb.BackupEncryptionOptions_KMSInfo
+			for _, encFile := range opts {
+				defaultKMSInfo, err = validateKMSURIsAgainstFullBackup([]string{kms},
+					newEncryptedDataKeyMapFromProtoMap(encFile.EncryptedDataKeyByKMSMasterKeyID), env)
+				if err == nil {
+					break
+				}
+			}
 			if err != nil {
 				return err
 			}
 			encryption = &jobspb.BackupEncryptionOptions{
 				Mode:    jobspb.EncryptionMode_KMS,
-				KMSInfo: defaultKMSInfo}
+				KMSInfo: defaultKMSInfo,
+			}
 		}
 		var incPaths []string
 		incStore := store
@@ -404,7 +467,7 @@ func backupShowerDefault(
 						}
 					}
 				}
-				descSizes := make(map[descpb.ID]RowCount)
+				descSizes := make(map[descpb.ID]roachpb.RowCount)
 				for _, file := range manifest.Files {
 					// TODO(dan): This assumes each file in the backup only
 					// contains data from a single table, which is usually but
@@ -416,7 +479,7 @@ func backupShowerDefault(
 						continue
 					}
 					s := descSizes[descpb.ID(tableID)]
-					s.add(file.EntryCounts)
+					s.Add(file.EntryCounts)
 					descSizes[descpb.ID(tableID)] = s
 				}
 				backupType := tree.NewDString("full")

@@ -38,12 +38,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -182,6 +182,9 @@ func init() {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cli.UsageAndErr(cmd, args)
 		},
+		// The debug backups command is hidden from the help
+		// to signal that it isn't yet a stable interface.
+		Hidden: true,
 	}
 
 	backupFlags := backupCmds.Flags()
@@ -563,36 +566,26 @@ func makeIters(
 func makeRowFetcher(
 	ctx context.Context, entry backupccl.BackupTableEntry, codec keys.SQLCodec,
 ) (row.Fetcher, error) {
-	colDescs := make([]catalog.Column, len(entry.Desc.PublicColumns()))
-	for i, col := range entry.Desc.PublicColumns() {
-		colDescs[i] = col
-	}
-
+	colIDs := entry.Desc.PublicColumnIDs()
 	if debugBackupArgs.withRevisions {
-		newCol, err := entry.Desc.FindColumnWithName(colinfo.MVCCTimestampColumnName)
-		if err != nil {
-			return row.Fetcher{}, errors.Wrapf(err, "get mvcc timestamp column")
-		}
-		colDescs = append(colDescs, newCol)
+		colIDs = append(colIDs, colinfo.MVCCTimestampColumnID)
 	}
 
-	table := row.FetcherTableArgs{
-		Desc:    entry.Desc,
-		Index:   entry.Desc.GetPrimaryIndex(),
-		Columns: colDescs,
+	var spec descpb.IndexFetchSpec
+	if err := rowenc.InitIndexFetchSpec(&spec, codec, entry.Desc, entry.Desc.GetPrimaryIndex(), colIDs); err != nil {
+		return row.Fetcher{}, err
 	}
 
 	var rf row.Fetcher
 	if err := rf.Init(
 		ctx,
-		codec,
 		false, /*reverse*/
 		descpb.ScanLockingStrength_FOR_NONE,
 		descpb.ScanLockingWaitPolicy_BLOCK,
 		0, /* lockTimeout */
 		&tree.DatumAlloc{},
 		nil, /*mon.BytesMonitor*/
-		table,
+		&spec,
 	); err != nil {
 		return rf, err
 	}

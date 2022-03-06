@@ -49,6 +49,7 @@ const (
 	OptCompression              = `compression`
 	OptSchemaChangeEvents       = `schema_change_events`
 	OptSchemaChangePolicy       = `schema_change_policy`
+	OptSplitColumnFamilies      = `split_column_families`
 	OptProtectDataFromGCOnPause = `protect_data_from_gc_on_pause`
 	OptWebhookAuthHeader        = `webhook_auth_header`
 	OptWebhookClientTimeout     = `webhook_client_timeout`
@@ -118,6 +119,10 @@ const (
 	OptKafkaSinkConfig   = `kafka_sink_config`
 	OptWebhookSinkConfig = `webhook_sink_config`
 
+	// OptSink allows users to alter the Sink URI of an existing changefeed.
+	// Note that this option is only allowed for alter changefeed statements.
+	OptSink = `sink`
+
 	SinkParamCACert                 = `ca_cert`
 	SinkParamClientCert             = `client_cert`
 	SinkParamClientKey              = `client_key`
@@ -174,6 +179,7 @@ var ChangefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
 	OptCompression:              sql.KVStringOptRequireValue,
 	OptSchemaChangeEvents:       sql.KVStringOptRequireValue,
 	OptSchemaChangePolicy:       sql.KVStringOptRequireValue,
+	OptSplitColumnFamilies:      sql.KVStringOptRequireNoValue,
 	OptInitialScan:              sql.KVStringOptRequireNoValue,
 	OptNoInitialScan:            sql.KVStringOptRequireNoValue,
 	OptProtectDataFromGCOnPause: sql.KVStringOptRequireNoValue,
@@ -199,7 +205,7 @@ var CommonOptions = makeStringSet(OptCursor, OptEnvelope,
 	OptFormat, OptFullTableName,
 	OptKeyInValue, OptTopicInValue,
 	OptResolvedTimestamps, OptUpdatedTimestamps,
-	OptMVCCTimestamps, OptDiff,
+	OptMVCCTimestamps, OptDiff, OptSplitColumnFamilies,
 	OptSchemaChangeEvents, OptSchemaChangePolicy,
 	OptProtectDataFromGCOnPause, OptOnError,
 	OptInitialScan, OptNoInitialScan,
@@ -233,3 +239,18 @@ var NoLongerExperimental = map[string]string{
 	DeprecatedSinkSchemeCloudStorageNodelocal: SinkSchemeCloudStorageNodelocal,
 	DeprecatedSinkSchemeCloudStorageS3:        SinkSchemeCloudStorageS3,
 }
+
+// AlterChangefeedUnsupportedOptions are changefeed options that we do not allow
+// users to alter
+var AlterChangefeedUnsupportedOptions = makeStringSet(OptCursor, OptInitialScan, OptNoInitialScan)
+
+// AlterChangefeedOptionExpectValues is used to parse alter changefeed options
+// using PlanHookState.TypeAsStringOpts().
+var AlterChangefeedOptionExpectValues = func() map[string]sql.KVStringOptValidate {
+	alterChangefeedOptions := make(map[string]sql.KVStringOptValidate, len(ChangefeedOptionExpectValues)+1)
+	for key, value := range ChangefeedOptionExpectValues {
+		alterChangefeedOptions[key] = value
+	}
+	alterChangefeedOptions[OptSink] = sql.KVStringOptRequireValue
+	return alterChangefeedOptions
+}()

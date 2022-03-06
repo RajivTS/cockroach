@@ -32,6 +32,7 @@ go_library(
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -42,6 +43,10 @@ gomock(
     library = ":rangefeed",
     package = "rangefeed",
     self_package = "github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed",
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 go_test(

@@ -36,7 +36,9 @@ go_test(
         "meta_test.go",
     ],
     embed = [":metamorphic"],
+    shard_count = 16,
     deps = [
+        "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/testutils/skip",
         "//pkg/util/leaktest",

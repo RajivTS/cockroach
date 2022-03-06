@@ -162,9 +162,17 @@ var ZipkinCollector = settings.RegisterValidatedStringSetting(
 	},
 ).WithPublic()
 
-// enableTracingByDefault controls whether Tracers configured with
-// WithTracingMode(TracingModeFromEnv) generally create spans or not.
-var enableTracingByDefault = envutil.EnvOrDefaultBool("COCKROACH_REAL_SPANS", false) || buildutil.CrdbTestBuild
+// EnableActiveSpansRegistry controls Tracers configured as
+// WithTracingMode(TracingModeFromEnv) (which is the default). When enabled,
+// spans are allocated and registered with the active spans registry until
+// finished. When disabled, span creation is short-circuited for a small
+// performance improvement.
+var EnableActiveSpansRegistry = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"trace.span_registry.enabled",
+	"if set, ongoing traces can be seen at https://<ui>/debug/tracez",
+	envutil.EnvOrDefaultBool("COCKROACH_REAL_SPANS", true),
+).WithPublic()
 
 // panicOnUseAfterFinish, if set, causes use of a span after Finish() to panic
 // if detected.
@@ -182,8 +190,7 @@ var debugUseAfterFinish = envutil.EnvOrDefaultBool("COCKROACH_DEBUG_SPAN_USE_AFT
 // the span mutexes end up being reused and locked repeatedly in random order on
 // the same goroutine. This erroneously looks like a potential deadlock to the
 // detector.
-var reuseSpans = (buildutil.CrdbTestBuild && !syncutil.DeadlockEnabled) ||
-	envutil.EnvOrDefaultBool("COCKROACH_REUSE_TRACING_SPANS", false)
+var reuseSpans = !syncutil.DeadlockEnabled && envutil.EnvOrDefaultBool("COCKROACH_REUSE_TRACING_SPANS", true)
 
 // detectSpanRefLeaks enables the detection of Span reference leaks - i.e.
 // failures to decrement a Span's reference count. If detection is enabled, such
@@ -269,8 +276,6 @@ type Tracer struct {
 	noopSpan        *Span
 	sterileNoopSpan *Span
 
-	tracingDefault TracingMode
-
 	// backardsCompatibilityWith211, if set, makes the Tracer
 	// work with 21.1 remote nodes.
 	//
@@ -292,6 +297,11 @@ type Tracer struct {
 	// for all spans that the parent Tracer creates.
 	otelTracer unsafe.Pointer
 
+	// activeSpansRegistryEnabled controls whether spans are created and
+	// registered with activeSpansRegistry until they're Finish()ed. If not
+	// enabled, span creation is generally a no-op unless a recording span is
+	// explicitly requested.
+	activeSpansRegistryEnabled bool
 	// activeSpans is a map that references all non-Finish'ed local root spans,
 	// i.e. those for which no WithParent(<non-nil>) option was supplied.
 	activeSpansRegistry *SpanRegistry
@@ -418,16 +428,26 @@ func (r *SpanRegistry) getSpanByID(id tracingpb.SpanID) RegistrySpan {
 // VisitSpans calls the visitor callback for every local root span in the
 // registry. Iterations stops when the visitor returns an error. If that error
 // is iterutils.StopIteration(), then VisitSpans() returns nil.
+//
+// The callback should not hold on to the span after it returns.
 func (r *SpanRegistry) VisitSpans(visitor func(span RegistrySpan) error) error {
+	// Take a snapshot of the registry and release the lock.
 	r.mu.Lock()
-	sl := make([]*crdbSpan, 0, len(r.mu.m))
+	spans := make([]spanRef, 0, len(r.mu.m))
 	for _, sp := range r.mu.m {
-		sl = append(sl, sp)
+		// We'll keep the spans alive while we're visiting them below.
+		spans = append(spans, makeSpanRef(sp.sp))
 	}
 	r.mu.Unlock()
 
-	for _, sp := range sl {
-		if err := visitor(sp); err != nil {
+	defer func() {
+		for i := range spans {
+			spans[i].release()
+		}
+	}()
+
+	for _, sp := range spans {
+		if err := visitor(sp.Span.i.crdb); err != nil {
 			if iterutil.Done(err) {
 				return nil
 			}
@@ -509,11 +529,10 @@ func (t *Tracer) SetRedactable(to bool) {
 	atomic.StoreInt32(&t._redactable, n)
 }
 
-// NewTracer creates a Tracer. It initially tries to run with minimal overhead
-// and collects essentially nothing; use Configure() to enable various tracing
-// backends.
+// NewTracer creates a Tracer with default options.
+//
+// See NewTracerWithOpt() for controlling various configuration options.
 func NewTracer() *Tracer {
-
 	var defaultSpanReusePercent uint32
 	if reuseSpans {
 		defaultSpanReusePercent = uint32(spanReusePercent)
@@ -522,8 +541,9 @@ func NewTracer() *Tracer {
 	}
 
 	t := &Tracer{
-		stack:               string(debug.Stack()),
-		activeSpansRegistry: makeSpanRegistry(),
+		stack:                      string(debug.Stack()),
+		activeSpansRegistryEnabled: true,
+		activeSpansRegistry:        makeSpanRegistry(),
 		// These might be overridden in NewTracerWithOpt.
 		panicOnUseAfterFinish: panicOnUseAfterFinish,
 		debugUseAfterFinish:   debugUseAfterFinish,
@@ -543,6 +563,7 @@ func NewTracer() *Tracer {
 			c := &h.crdbSpan
 			*c = crdbSpan{
 				tracer: t,
+				sp:     sp,
 			}
 			sp.i.crdb = c
 			return h
@@ -562,9 +583,6 @@ func NewTracerWithOpt(ctx context.Context, opts ...TracerOption) *Tracer {
 	}
 
 	t := NewTracer()
-	if o.sv != nil {
-		t.Configure(ctx, o.sv)
-	}
 	if o.useAfterFinishOpt != nil {
 		t.panicOnUseAfterFinish = o.useAfterFinishOpt.panicOnUseAfterFinish
 		t.debugUseAfterFinish = o.useAfterFinishOpt.debugUseAfterFinish
@@ -573,7 +591,10 @@ func NewTracerWithOpt(ctx context.Context, opts ...TracerOption) *Tracer {
 		t.spanReusePercent = *o.spanReusePercent
 	}
 	t.testing = o.knobs
-	t.tracingDefault = TracingMode(o.tracingDefault)
+	t.activeSpansRegistryEnabled = o.tracingDefault != TracingModeOnDemand
+	if o.sv != nil {
+		t.configure(ctx, o.sv, o.tracingDefault)
+	}
 	return t
 }
 
@@ -581,7 +602,7 @@ func NewTracerWithOpt(ctx context.Context, opts ...TracerOption) *Tracer {
 type tracerOptions struct {
 	sv                *settings.Values
 	knobs             TracerTestingKnobs
-	tracingDefault    tracingModeOpt
+	tracingDefault    TracingMode
 	useAfterFinishOpt *useAfterFinishOpt
 	// spanReusePercent, if not nil, controls the probability of span reuse. A
 	// negative value indicates that the default should come from the environment.
@@ -630,7 +651,7 @@ type tracingModeOpt TracingMode
 var _ TracerOption = tracingModeOpt(TracingModeFromEnv)
 
 func (o tracingModeOpt) apply(opt *tracerOptions) {
-	opt.tracingDefault = o
+	opt.tracingDefault = TracingMode(o)
 }
 
 // WithTracingMode configures the Tracer's tracing mode.
@@ -671,9 +692,9 @@ func WithUseAfterFinishOpt(panicOnUseAfterFinish, debugUseAfterFinish bool) Trac
 	}
 }
 
-// Configure sets up the Tracer according to the cluster settings (and keeps
+// configure sets up the Tracer according to the cluster settings (and keeps
 // it updated if they change).
-func (t *Tracer) Configure(ctx context.Context, sv *settings.Values) {
+func (t *Tracer) configure(ctx context.Context, sv *settings.Values, tracingDefault TracingMode) {
 	// traceProvider is captured by the function below.
 	var traceProvider *otelsdk.TracerProvider
 
@@ -684,6 +705,17 @@ func (t *Tracer) Configure(ctx context.Context, sv *settings.Values) {
 		otlpCollectorAddr := openTelemetryCollector.Get(sv)
 		zipkinAddr := ZipkinCollector.Get(sv)
 		enableRedactable := enableTraceRedactable.Get(sv)
+
+		switch tracingDefault {
+		case TracingModeFromEnv:
+			t.activeSpansRegistryEnabled = EnableActiveSpansRegistry.Get(sv)
+		case TracingModeOnDemand:
+			t.activeSpansRegistryEnabled = false
+		case TracingModeActiveSpansRegistry:
+			t.activeSpansRegistryEnabled = true
+		default:
+			panic(fmt.Sprintf("unrecognized tracing option: %v", tracingDefault))
+		}
 
 		t.SetRedactable(enableRedactable)
 
@@ -764,6 +796,7 @@ func (t *Tracer) Configure(ctx context.Context, sv *settings.Values) {
 
 	reconfigure(ctx)
 
+	EnableActiveSpansRegistry.SetOnChange(sv, reconfigure)
 	enableNetTrace.SetOnChange(sv, reconfigure)
 	openTelemetryCollector.SetOnChange(sv, reconfigure)
 	ZipkinCollector.SetOnChange(sv, reconfigure)
@@ -981,16 +1014,8 @@ func (t *Tracer) StartSpanCtx(
 // AlwaysTrace returns true if operations should be traced regardless of the
 // context.
 func (t *Tracer) AlwaysTrace() bool {
-	switch t.tracingDefault {
-	case TracingModeFromEnv:
-		if enableTracingByDefault {
-			return true
-		}
-	case TracingModeActiveSpansRegistry:
+	if t.activeSpansRegistryEnabled {
 		return true
-	case TracingModeOnDemand:
-	default:
-		panic(fmt.Sprintf("unrecognized tracing option: %v", t.tracingDefault))
 	}
 	otelTracer := t.getOtelTracer()
 	return t.useNetTrace() || otelTracer != nil
@@ -1112,6 +1137,8 @@ child operation: %s, tracer created at:
 
 	s.i.crdb.enableRecording(opts.recordingType())
 
+	s.i.crdb.parentSpanID = opts.parentSpanID()
+
 	var localRoot bool
 	{
 		// If a parent is specified, link the newly created Span to the parent.
@@ -1139,7 +1166,6 @@ child operation: %s, tracer created at:
 				added := parent.addChildLocked(s, !opts.ParentDoesNotCollectRecording)
 				if added {
 					localRoot = false
-					s.i.crdb.parentSpanID = opts.parentSpanID()
 					// We take over the reference in opts.Parent. The child will release
 					// it once when it nils out s.i.crdb.mu.parent (i.e. when either the
 					// parent of the child finish). Note that some methods on opts cannot
@@ -1342,9 +1368,10 @@ type RegistrySpan interface {
 	// span registry, we want as much information as possible to be included.
 	GetFullRecording(recType RecordingType) Recording
 
-	// SetVerbose sets the verbosity of the span appropriately and
-	// recurses on its children.
-	SetVerbose(to bool)
+	// SetRecordingType sets the recording mode of the span and its children,
+	// recursively. Setting it to RecordingOff disables further recording.
+	// Everything recorded so far remains in memory.
+	SetRecordingType(to RecordingType)
 }
 
 var _ RegistrySpan = &crdbSpan{}
@@ -1354,8 +1381,11 @@ func (t *Tracer) GetActiveSpanByID(spanID tracingpb.SpanID) RegistrySpan {
 	return t.activeSpansRegistry.getSpanByID(spanID)
 }
 
-// VisitSpans invokes the visitor with all active Spans. The function will
-// gracefully exit if the visitor returns iterutil.StopIteration().
+// VisitSpans calls the visitor callback for every local root span in the
+// registry. Iterations stops when the visitor returns an error. If that error
+// is iterutils.StopIteration(), then VisitSpans() returns nil.
+//
+// The callback should not hold on to the span after it returns.
 func (t *Tracer) VisitSpans(visitor func(span RegistrySpan) error) error {
 	return t.activeSpansRegistry.VisitSpans(visitor)
 }
@@ -1452,7 +1482,7 @@ func ForkSpan(ctx context.Context, opName string) (context.Context, *Span) {
 // creates a root span.
 func EnsureForkSpan(ctx context.Context, tr *Tracer, opName string) (context.Context, *Span) {
 	sp := SpanFromContext(ctx)
-	var opts []SpanOption
+	opts := make([]SpanOption, 0, 3)
 	// If there's a span in ctx, we use it as a parent.
 	if sp != nil {
 		tr = sp.Tracer()
@@ -1492,27 +1522,13 @@ func ChildSpan(ctx context.Context, opName string) (context.Context, *Span) {
 func EnsureChildSpan(
 	ctx context.Context, tr *Tracer, name string, os ...SpanOption,
 ) (context.Context, *Span) {
-	slp := optsPool.Get().(*[]SpanOption)
-	*slp = append(*slp, WithParent(SpanFromContext(ctx)))
-	*slp = append(*slp, os...)
-	ctx, sp := tr.StartSpanCtx(ctx, name, *slp...)
-	// Clear and zero-length the slice. Note that we have to clear
-	// explicitly or the options will continue to be referenced by
-	// the slice.
-	for i := range *slp {
-		(*slp)[i] = nil
-	}
-	*slp = (*slp)[0:0:cap(*slp)]
-	optsPool.Put(slp)
+	// NB: Making the capacity dynamic, based on len(os), makes this allocate.
+	// With a fixed length, it doesn't allocate.
+	opts := make([]SpanOption, 0, 3)
+	opts = append(opts, WithParent(SpanFromContext(ctx)))
+	opts = append(opts, os...)
+	ctx, sp := tr.StartSpanCtx(ctx, name, opts...)
 	return ctx, sp
-}
-
-var optsPool = sync.Pool{
-	New: func() interface{} {
-		// It is unusual to pass more than 5 SpanOptions.
-		sl := make([]SpanOption, 0, 5)
-		return &sl
-	},
 }
 
 // ContextWithRecordingSpan returns a context with an embedded trace Span. The
@@ -1533,7 +1549,7 @@ func ContextWithRecordingSpan(
 			if rec != nil {
 				return rec
 			}
-			rec = sp.FinishAndGetRecording(RecordingVerbose)
+			rec = sp.FinishAndGetConfiguredRecording()
 			return rec
 		}
 }

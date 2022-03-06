@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // TODO(Tobias): Figure out if it would make sense to save some
@@ -160,14 +161,20 @@ func (m *HybridManualClock) Increment(nanos int64) {
 	m.mu.Unlock()
 }
 
-// Forward sets the wall time to the supplied timestamp this moves the clock
-// forward in time.
-func (m *HybridManualClock) Forward(nanos int64) {
+// Forward sets the wall time to the supplied timestamp if this moves the clock
+// forward in time. Note that this takes an absolute timestamp (i.e. a wall
+// clock timestamp), not a delta.
+func (m *HybridManualClock) Forward(tsNanos int64) {
 	m.mu.Lock()
-	if nanos > m.mu.nanos {
-		m.mu.nanos = nanos
+	defer m.mu.Unlock()
+	now := UnixNano()
+	if tsNanos < now {
+		return
 	}
-	m.mu.Unlock()
+	aheadNanos := tsNanos - now
+	if aheadNanos > m.mu.nanos {
+		m.mu.nanos = aheadNanos
+	}
 }
 
 // Pause pauses the hybrid manual clock; the passage of time no longer causes
@@ -333,8 +340,8 @@ func (c *Clock) checkPhysicalClock(ctx context.Context, oldTime, newTime int64) 
 			log.Fatalf(
 				ctx,
 				"detected forward time jump of %f seconds is not allowed with tolerance of %f seconds",
-				log.Safe(float64(-interval)/1e9),
-				log.Safe(float64(toleratedForwardClockJump)/1e9),
+				redact.Safe(float64(-interval)/1e9),
+				redact.Safe(float64(toleratedForwardClockJump)/1e9),
 			)
 		}
 	}
@@ -378,8 +385,8 @@ func (c *Clock) enforceWallTimeWithinBoundLocked() {
 		log.Fatalf(
 			context.TODO(),
 			"wall time %d is not allowed to be greater than upper bound of %d.",
-			log.Safe(c.mu.timestamp.WallTime),
-			log.Safe(c.mu.wallTimeUpperBound),
+			redact.Safe(c.mu.timestamp.WallTime),
+			redact.Safe(c.mu.wallTimeUpperBound),
 		)
 	}
 }

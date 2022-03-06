@@ -43,7 +43,7 @@ func runSSTableCorruption(ctx context.Context, t test.Test, c cluster.Cluster) {
 			// to have multiple ranges, and some sstables with only table keys.
 			t.Status("importing tpcc fixture")
 			c.Run(ctx, workloadNode,
-				"./cockroach workload fixtures import tpcc --warehouses=100 --fks=false --checks=false")
+				"./cockroach workload fixtures import tpcc --warehouses=500 --fks=false --checks=false")
 			return nil
 		})
 		m.Wait()
@@ -55,7 +55,7 @@ func runSSTableCorruption(ctx context.Context, t test.Test, c cluster.Cluster) {
 		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(node),
 			"./cockroach debug pebble manifest dump {store-dir}/MANIFEST-* | grep -v added | grep -v deleted | grep \"\\[/Table\"")
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("could not find tables to corrupt: %s\nstdout: %s\nstderr: %s", err, result.Stdout, result.Stderr)
 		}
 		tableSSTs := strings.Split(result.Stdout, "\n")
 		if len(tableSSTs) == 0 {

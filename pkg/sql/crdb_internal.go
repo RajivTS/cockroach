@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -117,6 +118,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalGossipAlertsTableID:                crdbInternalGossipAlertsTable,
 		catconstants.CrdbInternalGossipLivenessTableID:              crdbInternalGossipLivenessTable,
 		catconstants.CrdbInternalGossipNetworkTableID:               crdbInternalGossipNetworkTable,
+		catconstants.CrdbInternalTransactionContentionEvents:        crdbInternalTransactionContentionEventsTable,
 		catconstants.CrdbInternalIndexColumnsTableID:                crdbInternalIndexColumnsTable,
 		catconstants.CrdbInternalIndexUsageStatisticsTableID:        crdbInternalIndexUsageStatistics,
 		catconstants.CrdbInternalInflightTraceSpanTableID:           crdbInternalInflightTraceSpanTable,
@@ -751,7 +753,7 @@ CREATE TABLE crdb_internal.jobs (
 			return nil, nil, err
 		}
 
-		cleanup := func() {
+		cleanup := func(ctx context.Context) {
 			if err := it.Close(); err != nil {
 				// TODO(yuzefovich): this error should be propagated further up
 				// and not simply being logged. Fix it (#61123).
@@ -1460,10 +1462,14 @@ CREATE TABLE crdb_internal.cluster_settings (
 			if err != nil {
 				return err
 			}
-			if !hasModify {
+			hasView, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING)
+			if err != nil {
+				return err
+			}
+			if !hasModify && !hasView {
 				return pgerror.Newf(pgcode.InsufficientPrivilege,
-					"only users with the %s privilege are allowed to read "+
-						"crdb_internal.cluster_settings", roleoption.MODIFYCLUSTERSETTING)
+					"only users with either %s or %s privileges are allowed to read "+
+						"crdb_internal.cluster_settings", roleoption.MODIFYCLUSTERSETTING, roleoption.VIEWCLUSTERSETTING)
 			}
 		}
 		for _, k := range settings.Keys(p.ExecCfg().Codec.ForSystemTenant()) {
@@ -2623,8 +2629,6 @@ CREATE TABLE crdb_internal.table_columns (
 }
 
 // crdbInternalTableIndexesTable exposes the index descriptors.
-//
-// TODO(tbg): prefix with kv_.
 var crdbInternalTableIndexesTable = virtualSchemaTable{
 	comment: "indexes accessible by current user in current database (KV scan)",
 	schema: `
@@ -2636,7 +2640,8 @@ CREATE TABLE crdb_internal.table_indexes (
   index_type       STRING NOT NULL,
   is_unique        BOOL NOT NULL,
   is_inverted      BOOL NOT NULL,
-  is_sharded       BOOL NOT NULL
+  is_sharded       BOOL NOT NULL,
+  created_at       TIMESTAMP
 )
 `,
 	generator: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
@@ -2658,6 +2663,15 @@ CREATE TABLE crdb_internal.table_indexes (
 						if idx.Primary() {
 							idxType = primary
 						}
+						createdAt := tree.DNull
+						if ts := idx.CreatedAt(); !ts.IsZero() {
+							tsDatum, err := tree.MakeDTimestamp(ts, time.Nanosecond)
+							if err != nil {
+								log.Warningf(ctx, "failed to construct timestamp for index: %v", err)
+							} else {
+								createdAt = tsDatum
+							}
+						}
 						row = append(row,
 							tableID,
 							tableName,
@@ -2667,6 +2681,7 @@ CREATE TABLE crdb_internal.table_indexes (
 							tree.MakeDBool(tree.DBool(idx.IsUnique())),
 							tree.MakeDBool(idx.GetType() == descpb.IndexDescriptor_INVERTED),
 							tree.MakeDBool(tree.DBool(idx.IsSharded())),
+							createdAt,
 						)
 						return pusher.pushRow(row...)
 					})
@@ -4455,7 +4470,7 @@ func collectMarshaledJobMetadataMap(
 			continue
 		}
 		for _, j := range tbl.GetMutationJobs() {
-			referencedJobIDs[jobspb.JobID(j.JobID)] = struct{}{}
+			referencedJobIDs[j.JobID] = struct{}{}
 		}
 	}
 	if len(referencedJobIDs) == 0 {
@@ -4548,7 +4563,11 @@ CREATE TABLE crdb_internal.invalid_objects (
 					)
 				}
 			}
-			ve := c.ValidateWithRecover(ctx, descriptor)
+			version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
+			ve := c.ValidateWithRecover(
+				ctx,
+				version,
+				descriptor)
 			for _, validationError := range ve {
 				addValidationErrorRow(validationError)
 			}
@@ -4905,7 +4924,7 @@ CREATE TABLE crdb_internal.default_privileges (
 	populate: func(ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, nil /* all databases */, true, /* requiresPrivileges */
 			func(descriptor catalog.DatabaseDescriptor) error {
-				addRowHelper := func(defaultPrivilegesForRole descpb.DefaultPrivilegesForRole) error {
+				addRowHelper := func(defaultPrivilegesForRole catpb.DefaultPrivilegesForRole) error {
 					role := tree.DNull
 					forAllRoles := tree.DBoolTrue
 					if defaultPrivilegesForRole.IsExplicitRole() {
@@ -4967,13 +4986,13 @@ CREATE TABLE crdb_internal.default_privileges (
 					}
 					return nil
 				}
-				addRowForRole := func(role descpb.DefaultPrivilegesRole) error {
-					defaultPrivilegeDescriptor := dbContext.GetDefaultPrivilegeDescriptor()
+				addRowForRole := func(role catpb.DefaultPrivilegesRole) error {
+					defaultPrivilegeDescriptor := descriptor.GetDefaultPrivilegeDescriptor()
 					defaultPrivilegesForRole, found := defaultPrivilegeDescriptor.GetDefaultPrivilegesForRole(role)
 					if !found {
 						// If an entry is not found for the role, the role still has
 						// the default set of default privileges.
-						newDefaultPrivilegesForRole := descpb.InitDefaultPrivilegesForRole(role, defaultPrivilegeDescriptor.GetDefaultPrivilegeDescriptorType())
+						newDefaultPrivilegesForRole := catpb.InitDefaultPrivilegesForRole(role, defaultPrivilegeDescriptor.GetDefaultPrivilegeDescriptorType())
 						defaultPrivilegesForRole = &newDefaultPrivilegesForRole
 					}
 					if err := addRowHelper(*defaultPrivilegesForRole); err != nil {
@@ -4982,7 +5001,7 @@ CREATE TABLE crdb_internal.default_privileges (
 					return nil
 				}
 				if err := forEachRole(ctx, p, func(username security.SQLUsername, isRole bool, options roleOptions, settings tree.Datum) error {
-					role := descpb.DefaultPrivilegesRole{
+					role := catpb.DefaultPrivilegesRole{
 						Role: username,
 					}
 					return addRowForRole(role)
@@ -4991,7 +5010,7 @@ CREATE TABLE crdb_internal.default_privileges (
 				}
 
 				// Handle ForAllRoles outside of forEachRole since it is a pseudo role.
-				role := descpb.DefaultPrivilegesRole{
+				role := catpb.DefaultPrivilegesRole{
 					ForAllRoles: true,
 				}
 				return addRowForRole(role)
@@ -5118,10 +5137,8 @@ CREATE TABLE crdb_internal.cluster_statement_statistics (
 				transactionFingerprintID := tree.NewDBytes(
 					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(statistics.Key.TransactionFingerprintID))))
 
-				// TODO(azhng): properly update plan_hash value once we can expose it
-				//  from the optimizer.
 				planHash := tree.NewDBytes(
-					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(0)))
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(statistics.Key.PlanHash)))
 
 				metadataJSON, err := sqlstatsutil.BuildStmtMetadataJSON(statistics)
 				if err != nil {
@@ -5441,5 +5458,102 @@ CREATE VIEW crdb_internal.tenant_usage_details AS
 		{Name: "total_write_requests", Typ: types.Int},
 		{Name: "total_sql_pod_seconds", Typ: types.Float},
 		{Name: "total_pgwire_egress_bytes", Typ: types.Int},
+	},
+}
+
+var crdbInternalTransactionContentionEventsTable = virtualSchemaTable{
+	comment: `cluster-wide transaction contention events. Querying this table is an
+		expensive operation since it creates a cluster-wide RPC-fanout.`,
+	schema: `
+CREATE TABLE crdb_internal.transaction_contention_events (
+    collection_ts                TIMESTAMPTZ NOT NULL,
+
+    blocking_txn_id              UUID NOT NULL,
+    blocking_txn_fingerprint_id  BYTES NOT NULL,
+
+    waiting_txn_id               UUID NOT NULL,
+    waiting_txn_fingerprint_id   BYTES NOT NULL,
+
+    contention_duration          INTERVAL NOT NULL,
+    contending_key               BYTES NOT NULL
+);`,
+	generator: func(ctx context.Context, p *planner, db catalog.DatabaseDescriptor, stopper *stop.Stopper) (virtualTableGenerator, cleanupFunc, error) {
+		resp, err := p.extendedEvalCtx.SQLStatusServer.TransactionContentionEvents(
+			ctx, &serverpb.TransactionContentionEventsRequest{})
+
+		if err != nil {
+			return nil, nil, err
+		}
+
+		hasPermission, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !hasPermission {
+			return nil, nil, errors.New("crdb_internal.transaction_contention_events " +
+				"requires VIEWACTIVITY or VIEWACTIVITYREDACTED role option")
+		}
+
+		// If a user has VIEWACTIVITYREDACTED role option but the user does not
+		// have the ADMIN role option, then the contending key should be redacted.
+		isAdmin, err := p.HasAdminRole(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		shouldRedactContendingKey := false
+		if !isAdmin {
+			shouldRedactContendingKey, err = p.HasRoleOption(ctx, roleoption.VIEWACTIVITYREDACTED)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+
+		row := make(tree.Datums, 6 /* number of columns for this virtual table */)
+		worker := func(ctx context.Context, pusher rowPusher) error {
+			for i := range resp.Events {
+				collectionTs, err := tree.MakeDTimestampTZ(resp.Events[i].CollectionTs, time.Microsecond)
+				if err != nil {
+					return err
+				}
+				blockingFingerprintID := tree.NewDBytes(
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(resp.Events[i].BlockingTxnFingerprintID))))
+
+				waitingFingerprintID := tree.NewDBytes(
+					tree.DBytes(sqlstatsutil.EncodeUint64ToBytes(uint64(resp.Events[i].WaitingTxnFingerprintID))))
+
+				contentionDuration := tree.NewDInterval(
+					duration.MakeDuration(
+						resp.Events[i].BlockingEvent.Duration.Nanoseconds(),
+						0, /* days */
+						0, /* months */
+					),
+					types.DefaultIntervalTypeMetadata,
+				)
+
+				contendingKey := tree.NewDBytes("")
+				if !shouldRedactContendingKey {
+					contendingKey = tree.NewDBytes(
+						tree.DBytes(resp.Events[i].BlockingEvent.Key))
+				}
+
+				row = row[:0]
+				row = append(row,
+					collectionTs, // collection_ts
+					tree.NewDUuid(tree.DUuid{UUID: resp.Events[i].BlockingEvent.TxnMeta.ID}), // blocking_txn_id
+					blockingFingerprintID, // blocking_fingerprint_id
+					tree.NewDUuid(tree.DUuid{UUID: resp.Events[i].WaitingTxnID}), // waiting_txn_id
+					waitingFingerprintID, // waiting_fingerprint_id
+					contentionDuration,   // contention_duration
+					contendingKey,        // contending_key
+				)
+
+				if err = pusher.pushRow(row...); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return setupGenerator(ctx, worker, stopper)
 	},
 }

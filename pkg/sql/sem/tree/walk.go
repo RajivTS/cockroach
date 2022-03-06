@@ -869,6 +869,86 @@ func walkReturningClause(v Visitor, clause ReturningClause) (ReturningClause, bo
 }
 
 // copyNode makes a copy of this Statement without recursing in any child Statements.
+func (n *ShowTenantClusterSetting) copyNode() *ShowTenantClusterSetting {
+	stmtCopy := *n
+	return &stmtCopy
+}
+
+// walkStmt is part of the walkableStmt interface.
+func (n *ShowTenantClusterSetting) walkStmt(v Visitor) Statement {
+	ret := n
+	sc, changed := walkStmt(v, n.ShowClusterSetting)
+	if changed {
+		ret = n.copyNode()
+		ret.ShowClusterSetting = sc.(*ShowClusterSetting)
+	}
+	if n.TenantID != nil {
+		e, changed := WalkExpr(v, n.TenantID)
+		if changed {
+			if ret == n {
+				ret = n.copyNode()
+			}
+			ret.TenantID = e
+		}
+	}
+	return ret
+}
+
+// copyNode makes a copy of this Statement without recursing in any child Statements.
+func (n *ShowTenantClusterSettingList) copyNode() *ShowTenantClusterSettingList {
+	stmtCopy := *n
+	return &stmtCopy
+}
+
+// walkStmt is part of the walkableStmt interface.
+func (n *ShowTenantClusterSettingList) walkStmt(v Visitor) Statement {
+	ret := n
+	sc, changed := walkStmt(v, n.ShowClusterSettingList)
+	if changed {
+		ret = n.copyNode()
+		ret.ShowClusterSettingList = sc.(*ShowClusterSettingList)
+	}
+	if n.TenantID != nil {
+		e, changed := WalkExpr(v, n.TenantID)
+		if changed {
+			if ret == n {
+				ret = n.copyNode()
+			}
+			ret.TenantID = e
+		}
+	}
+	return ret
+}
+
+// copyNode makes a copy of this Statement without recursing in any child Statements.
+func (n *AlterTenantSetClusterSetting) copyNode() *AlterTenantSetClusterSetting {
+	stmtCopy := *n
+	return &stmtCopy
+}
+
+// walkStmt is part of the walkableStmt interface.
+func (n *AlterTenantSetClusterSetting) walkStmt(v Visitor) Statement {
+	ret := n
+	if n.Value != nil {
+		e, changed := WalkExpr(v, n.Value)
+		if changed {
+			ret = n.copyNode()
+			ret.Value = e
+		}
+	}
+	if n.TenantID != nil {
+		e, changed := WalkExpr(v, n.TenantID)
+		if changed {
+			if ret == n {
+				ret = n.copyNode()
+			}
+			ret.TenantID = e
+		}
+	}
+	return ret
+}
+
+// copyNode makes a copy of this Statement without recursing in any child Statements.
 func (stmt *Backup) copyNode() *Backup {
 	stmtCopy := *stmt
 	stmtCopy.IncrementalFrom = append(Exprs(nil), stmt.IncrementalFrom...)
@@ -1571,6 +1651,7 @@ func (stmt *BeginTransaction) walkStmt(v Visitor) Statement {
 	return ret
 }
 
+var _ walkableStmt = &AlterTenantSetClusterSetting{}
 var _ walkableStmt = &CreateTable{}
 var _ walkableStmt = &Backup{}
 var _ walkableStmt = &Delete{}

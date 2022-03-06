@@ -107,7 +107,7 @@ func TestClosedTimestampCanServe(t *testing.T) {
 			baWrite.Txn = &txn
 			baWrite.Add(r)
 			baWrite.RangeID = repls[0].RangeID
-			if err := baWrite.SetActiveTimestamp(tc.Server(0).Clock().Now); err != nil {
+			if err := baWrite.SetActiveTimestamp(tc.Server(0).Clock()); err != nil {
 				t.Fatal(err)
 			}
 
@@ -589,7 +589,7 @@ func TestClosedTimestampCantServeForNonTransactionalBatch(t *testing.T) {
 		// Otherwise, all three should succeed.
 		baRead.Txn = nil
 		if tsFromServer {
-			baRead.TimestampFromServerClock = true
+			baRead.TimestampFromServerClock = (*hlc.ClockTimestamp)(&ts)
 			verifyNotLeaseHolderErrors(t, baRead, repls, 2)
 		} else {
 			testutils.SucceedsSoon(t, func() error {
@@ -605,6 +605,8 @@ func TestClosedTimestampCantServeForNonTransactionalBatch(t *testing.T) {
 func TestClosedTimestampFrozenAfterSubsumption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t)
 
 	for _, test := range []struct {
 		name string

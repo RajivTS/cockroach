@@ -16,10 +16,10 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -34,14 +34,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 type execPlan struct {
@@ -106,7 +107,7 @@ func (ep *execPlan) makeBuildScalarCtx() buildScalarCtx {
 func (ep *execPlan) getNodeColumnOrdinal(col opt.ColumnID) exec.NodeColumnOrdinal {
 	ord, ok := ep.outputCols.Get(int(col))
 	if !ok {
-		panic(errors.AssertionFailedf("column %d not in input", log.Safe(col)))
+		panic(errors.AssertionFailedf("column %d not in input", redact.Safe(col)))
 	}
 	return exec.NodeColumnOrdinal(ord)
 }
@@ -158,8 +159,10 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 		// `BEGIN; INSERT INTO ...; CREATE TABLE IF NOT EXISTS ...; COMMIT;`
 		// where the table already exists. This will generate some false schema
 		// cache refreshes, but that's expected to be quite rare in practice.
-		if !descs.UnsafeSkipSystemConfigTrigger.Get(&b.evalCtx.Settings.SV) {
-			if err := b.evalCtx.Txn.SetSystemConfigTrigger(b.evalCtx.Codec.ForSystemTenant()); err != nil {
+		if !b.evalCtx.Settings.Version.IsActive(
+			b.evalCtx.Ctx(), clusterversion.DisableSystemConfigGossipTrigger,
+		) {
+			if err := b.evalCtx.Txn.DeprecatedSetSystemConfigTrigger(b.evalCtx.Codec.ForSystemTenant()); err != nil {
 				return execPlan{}, errors.WithSecondaryError(
 					unimplemented.NewWithIssuef(26508,
 						"the first schema change statement in a transaction must precede any writes"),
@@ -534,22 +537,23 @@ func (b *Builder) scanParams(
 		var err error
 		switch {
 		case isInverted && isPartial:
-			err = fmt.Errorf(
+			err = pgerror.Newf(pgcode.WrongObjectType,
 				"index \"%s\" is a partial inverted index and cannot be used for this query",
 				idx.Name(),
 			)
 		case isInverted:
-			err = fmt.Errorf(
+			err = pgerror.Newf(pgcode.WrongObjectType,
 				"index \"%s\" is inverted and cannot be used for this query",
 				idx.Name(),
 			)
 		case isPartial:
-			err = fmt.Errorf(
+			err = pgerror.Newf(pgcode.WrongObjectType,
 				"index \"%s\" is a partial index that does not contain all the rows needed to execute this query",
 				idx.Name(),
 			)
 		default:
-			err = fmt.Errorf("index \"%s\" cannot be used for this query", idx.Name())
+			err = pgerror.Newf(pgcode.WrongObjectType,
+				"index \"%s\" cannot be used for this query", idx.Name())
 			if b.evalCtx.SessionData().DisallowFullTableScans &&
 				(b.ContainsLargeFullTableScan || b.ContainsLargeFullIndexScan) {
 				err = errors.WithHint(err,
@@ -1286,7 +1290,7 @@ func joinOpToJoinType(op opt.Operator) descpb.JoinType {
 		return descpb.LeftAntiJoin
 
 	default:
-		panic(errors.AssertionFailedf("not a join op %s", log.Safe(op)))
+		panic(errors.AssertionFailedf("not a join op %s", redact.Safe(op)))
 	}
 }
 
@@ -1531,7 +1535,7 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	case opt.ExceptAllOp:
 		typ, all = tree.ExceptOp, true
 	default:
-		panic(errors.AssertionFailedf("invalid operator %s", log.Safe(set.Op())))
+		panic(errors.AssertionFailedf("invalid operator %s", redact.Safe(set.Op())))
 	}
 
 	hardLimit := uint64(0)
@@ -2266,8 +2270,8 @@ func (b *Builder) extractWindowFunction(e opt.ScalarExpr) opt.ScalarExpr {
 	return b.extractWindowFunction(e.Child(0).(opt.ScalarExpr))
 }
 
-func (b *Builder) isOffsetMode(boundType tree.WindowFrameBoundType) bool {
-	return boundType == tree.OffsetPreceding || boundType == tree.OffsetFollowing
+func (b *Builder) isOffsetMode(boundType treewindow.WindowFrameBoundType) bool {
+	return boundType == treewindow.OffsetPreceding || boundType == treewindow.OffsetFollowing
 }
 
 func (b *Builder) buildFrame(input execPlan, w *memo.WindowsItem) (*tree.WindowFrame, error) {

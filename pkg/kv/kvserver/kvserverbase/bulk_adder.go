@@ -25,16 +25,6 @@ type BulkAdderOptions struct {
 	// behalf of which it is adding data.
 	Name string
 
-	// SSTSize is the size at which an SST will be flushed and a new one started.
-	// SSTs are also split during a buffer flush to avoid spanning range bounds so
-	// they may be smaller than this limit.
-	SSTSize func() int64
-
-	// SplitAndScatterAfter is the number of bytes which if added without hitting
-	// an existing split will cause the adder to split and scatter the next span.
-	// A function returning -1 is interpreted as indicating not to split.
-	SplitAndScatterAfter func() int64
-
 	// MinBufferSize is the initial size of the BulkAdder buffer. It indicates the
 	// amount of memory we require to be able to buffer data before flushing for
 	// SST creation.
@@ -68,9 +58,11 @@ type BulkAdderOptions struct {
 	// actually applied to each key).
 	BatchTimestamp hlc.Timestamp
 
-	// WriteAtRequestTime is used to set the corresponding field when sending
-	// constructed SSTables to AddSSTable. See roachpb.AddSSTableRequest.
-	WriteAtRequestTime bool
+	// WriteAtBatchTimestamp will rewrite the SST to use the batch timestamp, even
+	// if it gets pushed to a different timestamp on the server side. All SST MVCC
+	// timestamps must equal BatchTimestamp. See
+	// roachpb.AddSSTableRequest.SSTTimestampToRequestTimestamp.
+	WriteAtBatchTimestamp bool
 
 	// InitialSplitsIfUnordered specifies a number of splits to make before the
 	// first flush of the buffer if the contents of that buffer were unsorted.
@@ -81,10 +73,6 @@ type BulkAdderOptions struct {
 	// sample of the overall input.
 	InitialSplitsIfUnordered int
 }
-
-// DisableExplicitSplits can be returned by a SplitAndScatterAfter function to
-// indicate that the SSTBatcher should not issue explicit splits.
-const DisableExplicitSplits = -1
 
 // BulkAdderFactory describes a factory function for BulkAdders.
 type BulkAdderFactory func(

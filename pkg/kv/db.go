@@ -14,9 +14,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -24,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -582,24 +585,48 @@ func (db *DB) AdminSplit(
 	return getOneErr(db.Run(ctx, b), b)
 }
 
+// SplitAndScatterResult carries wraps information about the SplitAndScatter
+// call, including how long each step took or stats for range scattered.
+type SplitAndScatterResult struct {
+	// Timing indicates how long each step in this multi-step call took.
+	Timing struct {
+		Split   time.Duration
+		Scatter time.Duration
+	}
+	// Stats describe the scattered range, as returned by the AdminScatter call.
+	Stats *enginepb.MVCCStats
+}
+
 // SplitAndScatter is a helper that wraps AdminSplit + AdminScatter.
 func (db *DB) SplitAndScatter(
 	ctx context.Context, key roachpb.Key, expirationTime hlc.Timestamp, predicateKeys ...roachpb.Key,
-) error {
+) (SplitAndScatterResult, error) {
+	beforeSplit := timeutil.Now()
 	b := &Batch{}
 	b.adminSplit(key, expirationTime, predicateKeys)
 	if err := getOneErr(db.Run(ctx, b), b); err != nil {
-		return err
+		return SplitAndScatterResult{}, err
 	}
+	beforeScatter := timeutil.Now()
 
 	scatterReq := &roachpb.AdminScatterRequest{
 		RequestHeader:   roachpb.RequestHeaderFromSpan(roachpb.Span{Key: key, EndKey: key.Next()}),
 		RandomizeLeases: true,
 	}
-	if _, pErr := SendWrapped(ctx, db.NonTransactionalSender(), scatterReq); pErr != nil {
-		return pErr.GoError()
+	raw, pErr := SendWrapped(ctx, db.NonTransactionalSender(), scatterReq)
+	if pErr != nil {
+		return SplitAndScatterResult{}, pErr.GoError()
 	}
-	return nil
+	reply := SplitAndScatterResult{}
+	reply.Timing.Split = beforeScatter.Sub(beforeSplit)
+	reply.Timing.Scatter = timeutil.Since(beforeScatter)
+	resp, ok := raw.(*roachpb.AdminScatterResponse)
+	if !ok {
+		return reply, errors.Errorf("unexpected response of type %T for AdminScatter", raw)
+	}
+	reply.Stats = resp.MVCCStats
+
+	return reply, nil
 }
 
 // AdminUnsplit removes the sticky bit of the range specified by splitKey.
@@ -688,7 +715,7 @@ func (db *DB) AddSSTable(
 ) error {
 	b := &Batch{Header: roachpb.Header{Timestamp: batchTs}}
 	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
-		stats, ingestAsWrites, false /* writeAtBatchTS */, hlc.Timestamp{} /* sstTimestamp */)
+		stats, ingestAsWrites, hlc.Timestamp{} /* sstTimestampToRequestTimestamp */)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -711,7 +738,7 @@ func (db *DB) AddSSTableAtBatchTimestamp(
 ) (hlc.Timestamp, error) {
 	b := &Batch{Header: roachpb.Header{Timestamp: batchTs}}
 	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
-		stats, ingestAsWrites, true /* writeAtBatchTS */, batchTs)
+		stats, ingestAsWrites, batchTs)
 	err := getOneErr(db.Run(ctx, b), b)
 	if err != nil {
 		return hlc.Timestamp{}, err
@@ -851,6 +878,18 @@ func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
 // from recoverable internal errors, and is automatically committed
 // otherwise. The retryable function should have no side effects which could
 // cause problems in the event it must be run more than once.
+// For example:
+// err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+//		if kv, err := txn.Get(ctx, key); err != nil {
+//			return err
+//		}
+//		// ...
+//		return nil
+//	})
+// Note that once the transaction encounters a retryable error, the txn object
+// is marked as poisoned and all future ops fail fast until the retry. The
+// callback may return either nil or the retryable error. Txn is responsible for
+// resetting the transaction and retrying the callback.
 func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) error) error {
 	// TODO(radu): we should open a tracing Span here (we need to figure out how
 	// to use the correct tracer).
@@ -860,6 +899,25 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	// https://github.com/cockroachdb/cockroach/issues/48008
 	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
 	txn := NewTxn(ctx, db, nodeID)
+	txn.SetDebugName("unnamed")
+	return runTxn(ctx, txn, retryable)
+}
+
+// TxnWithSteppingEnabled is the same Txn, but represents a request originating
+// from SQL and has stepping enabled and quality of service set.
+func (db *DB) TxnWithSteppingEnabled(
+	ctx context.Context,
+	qualityOfService sessiondatapb.QoSLevel,
+	retryable func(context.Context, *Txn) error,
+) error {
+	// TODO(radu): we should open a tracing Span here (we need to figure out how
+	// to use the correct tracer).
+
+	// Observed timestamps don't work with multi-tenancy. See:
+	//
+	// https://github.com/cockroachdb/cockroach/issues/48008
+	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
+	txn := NewTxnWithSteppingEnabled(ctx, db, nodeID, qualityOfService)
 	txn.SetDebugName("unnamed")
 	return runTxn(ctx, txn, retryable)
 }

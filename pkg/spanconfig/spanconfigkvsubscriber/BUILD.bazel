@@ -3,8 +3,9 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "spanconfigkvsubscriber",
     srcs = [
+        "dummy.go",
         "kvsubscriber.go",
-        "span_config_decoder.go",
+        "spanconfigdecoder.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber",
     visibility = ["//visibility:public"],
@@ -37,7 +38,7 @@ go_test(
         "datadriven_test.go",
         "kvsubscriber_test.go",
         "main_test.go",
-        "span_config_decoder_test.go",
+        "spanconfigdecoder_test.go",
     ],
     data = glob(["testdata/**"]),
     embed = [":spanconfigkvsubscriber"],

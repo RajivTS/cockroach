@@ -23,10 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/redact"
-	"github.com/cockroachdb/sentry-go"
+	sentry "github.com/getsentry/sentry-go"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
 )
@@ -93,7 +92,7 @@ func TestCrashReportingPacket(t *testing.T) {
 	func() {
 		defer expectPanic("before server start")
 		defer logcrash.RecoverAndReportPanic(ctx, &st.SV)
-		panic(log.Safe(panicPre))
+		panic(redact.Safe(panicPre))
 	}()
 
 	func() {
@@ -101,7 +100,7 @@ func TestCrashReportingPacket(t *testing.T) {
 		defer logcrash.RecoverAndReportPanic(ctx, &st.SV)
 		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 		s.Stopper().Stop(ctx)
-		panic(log.Safe(panicPost))
+		panic(redact.Safe(panicPost))
 	}()
 
 	const prefix = "crash_reporting_packet_test.go:"

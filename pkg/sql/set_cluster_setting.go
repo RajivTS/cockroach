@@ -67,10 +67,20 @@ func checkPrivilegesForSetting(ctx context.Context, p *planner, name string, act
 	if err != nil {
 		return err
 	}
-	if !hasModify {
+	if action == "set" && !hasModify {
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
 			"only users with the %s privilege are allowed to %s cluster setting '%s'",
 			roleoption.MODIFYCLUSTERSETTING, action, name)
+	}
+	hasView, err := p.HasRoleOption(ctx, roleoption.VIEWCLUSTERSETTING)
+	if err != nil {
+		return err
+	}
+	// check that for "show" action user has either MODIFYCLUSTERSETTING or VIEWCLUSTERSETTING privileges.
+	if action == "show" && !(hasModify || hasView) {
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"only users with either %s or %s privileges are allowed to %s cluster setting '%s'",
+			roleoption.MODIFYCLUSTERSETTING, roleoption.VIEWCLUSTERSETTING, action, name)
 	}
 	return nil
 }
@@ -96,16 +106,40 @@ func (p *planner) SetClusterSetting(
 		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
 	}
 
-	if setting.Class() == settings.SystemOnly && !p.execCfg.Codec.ForSystemTenant() {
-		return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-			"setting %s is only settable in the system tenant", name)
+	if !p.execCfg.Codec.ForSystemTenant() {
+		switch setting.Class() {
+		case settings.SystemOnly:
+			// The Lookup call above should never return SystemOnly settings if this
+			// is a tenant.
+			return nil, errors.AssertionFailedf("looked up system-only setting")
+		case settings.TenantReadOnly:
+			return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "setting %s is only settable by the operator", name)
+		}
 	}
 
+	if st.OverridesInformer != nil && st.OverridesInformer.IsOverridden(name) {
+		return nil, errors.Errorf("cluster setting '%s' is currently overridden by the operator", name)
+	}
+
+	value, err := p.getAndValidateTypedClusterSetting(ctx, name, n.Value, setting)
+	if err != nil {
+		return nil, err
+	}
+
+	csNode := setClusterSettingNode{
+		name: name, st: st, setting: setting, value: value,
+		versionUpgradeHook: p.execCfg.VersionUpgradeHook,
+	}
+	return &csNode, nil
+}
+
+func (p *planner) getAndValidateTypedClusterSetting(
+	ctx context.Context, name string, expr tree.Expr, setting settings.NonMaskedSetting,
+) (tree.TypedExpr, error) {
 	var value tree.TypedExpr
-	if n.Value != nil {
+	if expr != nil {
 		// For DEFAULT, let the value reference be nil. That's a RESET in disguise.
-		if _, ok := n.Value.(tree.DefaultVal); !ok {
-			expr := n.Value
+		if _, ok := expr.(tree.DefaultVal); !ok {
 			expr = paramparse.UnresolvedNameToStrVal(expr)
 
 			var requiredType *types.T
@@ -152,34 +186,17 @@ func (p *planner) SetClusterSetting(
 				}
 				return nil, err
 			}
-
 			value = typed
 		} else if _, isVersionSetting := setting.(*settings.VersionSetting); isVersionSetting {
 			return nil, errors.New("cannot RESET cluster version setting")
 		}
 	}
-
-	csNode := setClusterSettingNode{
-		name: name, st: st, setting: setting, value: value,
-		versionUpgradeHook: p.execCfg.VersionUpgradeHook,
-	}
-	return &csNode, nil
+	return value, nil
 }
 
 func (n *setClusterSettingNode) startExec(params runParams) error {
 	if !params.p.ExtendedEvalContext().TxnImplicit {
 		return errors.Errorf("SET CLUSTER SETTING cannot be used inside a transaction")
-	}
-
-	// Set the system config trigger explicitly here as it might not happen
-	// implicitly due to the setting of the
-	// sql.catalog.unsafe_skip_system_config_trigger.enabled cluster setting.
-	// The usage of gossip to propagate cluster settings in the system tenant
-	// will be fixed in an upcoming PR with #70566.
-	if err := params.p.EvalContext().Txn.SetSystemConfigTrigger(
-		params.EvalContext().Codec.ForSystemTenant(),
-	); err != nil {
-		return err
 	}
 
 	execCfg := params.extendedEvalCtx.ExecCfg
@@ -299,7 +316,11 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			}
 
 			if knobs := params.p.execCfg.TenantTestingKnobs; knobs != nil && knobs.ClusterSettingsUpdater != nil {
-				if err := params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(ctx, n.name, encoded, n.setting.Typ()); err != nil {
+				encVal := settings.EncodedValue{
+					Value: encoded,
+					Type:  n.setting.Typ(),
+				}
+				if err := params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(ctx, n.name, encVal); err != nil {
 					return err
 				}
 			}

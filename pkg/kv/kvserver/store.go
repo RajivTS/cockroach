@@ -40,8 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tscache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnrecovery"
@@ -188,13 +188,12 @@ var queueAdditionOnSystemConfigUpdateBurst = settings.RegisterIntSetting(
 	settings.NonNegativeInt,
 )
 
-// leaseTransferWait limits the amount of time a drain command waits for lease
-// and Raft leadership transfers.
+// leaseTransferWait is the timeout for a single iteration of draining range leases.
 var leaseTransferWait = func() *settings.DurationSetting {
 	s := settings.RegisterDurationSetting(
 		settings.TenantWritable,
 		leaseTransferWaitSettingName,
-		"the amount of time a server waits to transfer range leases before proceeding with the rest of the shutdown process "+
+		"the timeout for a single iteration of the range lease transfer phase of draining "+
 			"(note that the --drain-wait parameter for cockroach node drain may need adjustment "+
 			"after changing this setting)",
 		5*time.Second,
@@ -246,7 +245,13 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 		CoalescedHeartbeatsInterval: 50 * time.Millisecond,
 		ScanInterval:                10 * time.Minute,
 		HistogramWindowInterval:     metric.TestSampleInterval,
-		ProtectedTimestampCache:     protectedts.EmptyCache(clock),
+		ProtectedTimestampReader:    spanconfig.EmptyProtectedTSReader(clock),
+
+		// Use a constant empty system config, which mirrors the previously
+		// existing logic to install an empty system config in gossip.
+		SystemConfigProvider: config.NewConstantSystemConfigProvider(
+			config.NewSystemConfig(zonepb.DefaultZoneConfigRef()),
+		),
 	}
 
 	// Use shorter Raft tick settings in order to minimize start up and failover
@@ -696,21 +701,24 @@ increasing over time (see Replica.setTombstoneKey).
 NOTE: to the best of our knowledge, we don't rely on this invariant.
 */
 type Store struct {
-	Ident              *roachpb.StoreIdent // pointer to catch access before Start() is called
-	cfg                StoreConfig
-	db                 *kv.DB
-	engine             storage.Engine // The underlying key-value store
-	tsCache            tscache.Cache  // Most recent timestamps for keys / key ranges
-	allocator          Allocator      // Makes allocation decisions
-	replRankings       *replicaRankings
-	storeRebalancer    *StoreRebalancer
-	rangeIDAlloc       *idalloc.Allocator          // Range ID allocator
-	mvccGCQueue        *mvccGCQueue                // MVCC GC queue
-	mergeQueue         *mergeQueue                 // Range merging queue
-	splitQueue         *splitQueue                 // Range splitting queue
-	replicateQueue     *replicateQueue             // Replication queue
-	replicaGCQueue     *replicaGCQueue             // Replica GC queue
-	raftLogQueue       *raftLogQueue               // Raft log truncation queue
+	Ident           *roachpb.StoreIdent // pointer to catch access before Start() is called
+	cfg             StoreConfig
+	db              *kv.DB
+	engine          storage.Engine // The underlying key-value store
+	tsCache         tscache.Cache  // Most recent timestamps for keys / key ranges
+	allocator       Allocator      // Makes allocation decisions
+	replRankings    *replicaRankings
+	storeRebalancer *StoreRebalancer
+	rangeIDAlloc    *idalloc.Allocator // Range ID allocator
+	mvccGCQueue     *mvccGCQueue       // MVCC GC queue
+	mergeQueue      *mergeQueue        // Range merging queue
+	splitQueue      *splitQueue        // Range splitting queue
+	replicateQueue  *replicateQueue    // Replication queue
+	replicaGCQueue  *replicaGCQueue    // Replica GC queue
+	raftLogQueue    *raftLogQueue      // Raft log truncation queue
+	// Carries out truncations proposed by the raft log queue, and "replicated"
+	// via raft, when they are safe. Created in Store.Start.
+	raftTruncator      *raftLogTruncator
 	raftSnapshotQueue  *raftSnapshotQueue          // Raft repair queue
 	tsMaintenanceQueue *timeSeriesMaintenanceQueue // Time series maintenance queue
 	scanner            *replicaScanner             // Replica scanner
@@ -723,7 +731,7 @@ type Store struct {
 	limiters           batcheval.Limiters
 	txnWaitMetrics     *txnwait.Metrics
 	sstSnapshotStorage SSTSnapshotStorage
-	protectedtsCache   protectedts.Cache
+	protectedtsReader  spanconfig.ProtectedTSReader
 	ctSender           *sidetransport.Sender
 
 	// gossipRangeCountdown and leaseRangeCountdown are countdowns of
@@ -1035,14 +1043,14 @@ type StoreConfig struct {
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
 
-	// ProtectedTimestampCache maintains the state of the protected timestamp
-	// subsystem. It is queried during the GC process and in the handling of
-	// AdminVerifyProtectedTimestampRequest.
-	ProtectedTimestampCache protectedts.Cache
+	// ProtectedTimestampReader provides a read-only view into the protected
+	// timestamp subsystem. It is queried during the GC process.
+	ProtectedTimestampReader spanconfig.ProtectedTSReader
 
 	// KV Memory Monitor. Must be non-nil for production, and can be nil in some
 	// tests.
-	KVMemoryMonitor *mon.BytesMonitor
+	KVMemoryMonitor        *mon.BytesMonitor
+	RangefeedBudgetFactory *rangefeed.BudgetFactory
 
 	// SpanConfigsDisabled determines whether we're able to use the span configs
 	// infrastructure or not.
@@ -1054,6 +1062,13 @@ type StoreConfig struct {
 
 	// KVAdmissionController is an optional field used for admission control.
 	KVAdmissionController KVAdmissionController
+
+	// SystemConfigProvider is used to drive replication decision-making in the
+	// mixed-version state, before the span configuration infrastructure has been
+	// bootstrapped.
+	//
+	// TODO(ajwerner): Remove in 22.2.
+	SystemConfigProvider config.SystemConfigProvider
 }
 
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
@@ -1210,7 +1225,7 @@ func NewStore(
 	if err := s.sstSnapshotStorage.Clear(); err != nil {
 		log.Warningf(ctx, "failed to clear snapshot storage: %v", err)
 	}
-	s.protectedtsCache = cfg.ProtectedTimestampCache
+	s.protectedtsReader = cfg.ProtectedTimestampReader
 
 	// On low-CPU instances, a default limit value may still allow ExportRequests
 	// to tie up all cores so cap limiter at cores-1 when setting value is higher.
@@ -1354,6 +1369,10 @@ func (s *Store) AnnotateCtx(ctx context.Context) context.Context {
 // rejected, prevents all of the Store's Replicas from acquiring or extending
 // range leases, and attempts to transfer away any leases owned.
 // When called with 'false', returns to the normal mode of operation.
+//
+// Note: this code represents ONE round of draining. This code is iterated on
+// indefinitely until all leases are transferred away.
+// This iteration can be found here: pkg/cli/start.go, pkg/cli/quit.go.
 //
 // The reporter callback, if non-nil, is called on a best effort basis
 // to report work that needed to be done and which may or may not have
@@ -1812,6 +1831,15 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	})
 	s.metrics.registry.AddMetricStruct(s.intentResolver.Metrics)
 
+	// Create the raft log truncator and register the callback.
+	s.raftTruncator = makeRaftLogTruncator(s.cfg.AmbientCtx, (*storeForTruncatorImpl)(s), stopper)
+	{
+		truncator := s.raftTruncator
+		s.engine.RegisterFlushCompletedCallback(func() {
+			truncator.durabilityAdvancedCallback()
+		})
+	}
+
 	// Create the recovery manager.
 	s.recoveryMgr = txnrecovery.NewManager(
 		s.cfg.AmbientCtx, s.cfg.Clock, s.db, stopper,
@@ -1851,9 +1879,9 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 				return errors.AssertionFailedf(
 					"found RangeDescriptor for range %d at generation %d which does not"+
 						" contain this store %d",
-					log.Safe(desc.RangeID),
-					log.Safe(desc.Generation),
-					log.Safe(s.StoreID()))
+					redact.Safe(desc.RangeID),
+					redact.Safe(desc.Generation),
+					redact.Safe(s.StoreID()))
 			}
 
 			rep, err := newReplica(ctx, &desc, s, replicaDesc.ReplicaID)
@@ -1880,9 +1908,9 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			} else {
 				return errors.AssertionFailedf("found newly constructed replica"+
 					" for range %d at generation %d with an invalid tenant ID in store %d",
-					log.Safe(desc.RangeID),
-					log.Safe(desc.Generation),
-					log.Safe(s.StoreID()))
+					redact.Safe(desc.RangeID),
+					redact.Safe(desc.Generation),
+					redact.Safe(s.StoreID()))
 			}
 
 			if _, ok := desc.GetReplicaDescriptor(s.StoreID()); !ok {
@@ -1915,24 +1943,25 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		s.cfg.NodeLiveness.RegisterCallback(s.nodeIsLiveCallback)
 	}
 
-	// Gossip is only ever nil while bootstrapping a cluster and
-	// in unittests.
-	if s.cfg.Gossip != nil {
-		// Register update channel for any changes to the system config.
-		// This may trigger splits along structured boundaries,
-		// and update max range bytes.
-		gossipUpdateC := s.cfg.Gossip.RegisterSystemConfigChannel()
+	// SystemConfigProvider can be nil during some tests.
+	if scp := s.cfg.SystemConfigProvider; scp != nil {
+		systemCfgUpdateC, _ := scp.RegisterSystemConfigChannel()
 		_ = s.stopper.RunAsyncTask(ctx, "syscfg-listener", func(context.Context) {
 			for {
 				select {
-				case <-gossipUpdateC:
-					cfg := s.cfg.Gossip.GetSystemConfig()
+				case <-systemCfgUpdateC:
+					cfg := scp.GetSystemConfig()
 					s.systemGossipUpdate(cfg)
 				case <-s.stopper.ShouldQuiesce():
 					return
 				}
 			}
 		})
+	}
+
+	// Gossip is only ever nil while bootstrapping a cluster and
+	// in unittests.
+	if s.cfg.Gossip != nil {
 
 		// Start a single goroutine in charge of periodically gossiping the
 		// sentinel and first range metadata if we have a first range.
@@ -1954,7 +1983,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	if !s.cfg.SpanConfigsDisabled {
-		s.cfg.SpanConfigSubscriber.Subscribe(func(update roachpb.Span) {
+		s.cfg.SpanConfigSubscriber.Subscribe(func(ctx context.Context, update roachpb.Span) {
 			s.onSpanConfigUpdate(ctx, update)
 		})
 
@@ -1965,9 +1994,9 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			enabled := spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV)
 			if enabled {
 				s.applyAllFromSpanConfigStore(ctx)
-			} else {
-				if s.cfg.Gossip != nil && s.cfg.Gossip.GetSystemConfig() != nil {
-					s.systemGossipUpdate(s.cfg.Gossip.GetSystemConfig())
+			} else if scp := s.cfg.SystemConfigProvider; scp != nil {
+				if sc := scp.GetSystemConfig(); sc != nil {
+					s.systemGossipUpdate(sc)
 				}
 			}
 		})
@@ -2110,11 +2139,6 @@ func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, erro
 		return nil, errSysCfgUnavailable
 	}
 
-	sysCfg := s.cfg.Gossip.GetSystemConfig()
-	if sysCfg == nil {
-		return nil, errSysCfgUnavailable
-	}
-
 	// We need a version gate here before switching over to the span configs
 	// infrastructure. In a mixed-version cluster we need to wait for
 	// the host tenant to have fully populated `system.span_configurations`
@@ -2142,6 +2166,11 @@ func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, erro
 		!spanconfigstore.EnabledSetting.Get(&s.ClusterSettings().SV) ||
 		!s.cfg.Settings.Version.IsActive(ctx, clusterversion.EnableSpanConfigStore) ||
 		s.TestingKnobs().UseSystemConfigSpanForQueues {
+
+		sysCfg := s.cfg.SystemConfigProvider.GetSystemConfig()
+		if sysCfg == nil {
+			return nil, errSysCfgUnavailable
+		}
 		return sysCfg, nil
 	}
 
@@ -2364,45 +2393,43 @@ func (s *Store) onSpanConfigUpdate(ctx context.Context, updated roachpb.Span) {
 				return nil // placeholder; ignore
 			}
 
-			startKey := repl.Desc().StartKey
-			if !sp.ContainsKey(startKey) {
-				// It's possible that the update we're receiving here is the
-				// right-hand side of a span config getting split. Think of
-				// installing a zone config on some partition of an index where
-				// previously there was none on any of the partitions. The range
-				// spanning the entire index would have to split on the
-				// partition boundary, and before it does so, it's possible that
-				// it would receive a span config update for just the partition.
-				//
-				// To avoid clobbering the pre-split range's embedded span
-				// config with the partition's config, we'll ensure that the
-				// range's start key is part of the update. We don't have to
-				// enqueue the range in the split queue here, that takes place
-				// when processing the left-hand side span config update.
-
-				return nil // ignore
-			}
-
-			// TODO(irfansharif): It's possible for a config to be applied over an
-			// entire range when it only pertains to the first half of the range.
-			// This will be corrected shortly -- we enqueue the range for a split
-			// below where we then apply the right config on each half. But still,
-			// it's surprising behavior and gets in the way of a desirable
-			// consistency guarantee: a key's config at any point in time is one
-			// that was explicitly declared over it, or the default config.
-			//
-			// We can do better, we can skip applying the config entirely and
-			// enqueue the split, then relying on the split trigger to install
-			// the right configs on each half. The current structure is as it is
-			// to maintain parity with the system config span variant.
-
 			replCtx := repl.AnnotateCtx(ctx)
-			conf, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, startKey)
-			if err != nil {
-				log.Errorf(ctx, "skipped applying update, unexpected error reading from subscriber: %v", err)
-				return err
+			startKey := repl.Desc().StartKey
+			if sp.ContainsKey(startKey) {
+				// It's possible that the update we're receiving here implies a split.
+				// If the update corresponds to what would be the config for the
+				// right-hand side after the split, we avoid clobbering the pre-split
+				// range's embedded span config by checking if the start key is part of
+				// the update.
+				//
+				// Even if we're dealing with what would be the right-hand side after
+				// the split is processed, we still want to nudge the split queue
+				// below -- we can't instead rely on there being an update for the
+				// left-hand side of the split. Concretely, consider the case when a
+				// new table is added with a different configuration to its (left)
+				// adjacent table. This results in a single update, corresponding to the
+				// new table's span, which forms the right-hand side post split.
+
+				// TODO(irfansharif): It's possible for a config to be applied over an
+				// entire range when it only pertains to the first half of the range.
+				// This will be corrected shortly -- we enqueue the range for a split
+				// below where we then apply the right config on each half. But still,
+				// it's surprising behavior and gets in the way of a desirable
+				// consistency guarantee: a key's config at any point in time is one
+				// that was explicitly declared over it, or the default config.
+				//
+				// We can do better, we can skip applying the config entirely and
+				// enqueue the split, then relying on the split trigger to install
+				// the right configs on each half. The current structure is as it is
+				// to maintain parity with the system config span variant.
+
+				conf, err := s.cfg.SpanConfigSubscriber.GetSpanConfigForKey(replCtx, startKey)
+				if err != nil {
+					log.Errorf(ctx, "skipped applying update, unexpected error reading from subscriber: %v", err)
+					return err
+				}
+				repl.SetSpanConfig(conf)
 			}
-			repl.SetSpanConfig(conf)
 
 			// TODO(irfansharif): For symmetry with the system config span variant,
 			// we queue blindly; we could instead only queue it if we knew the
@@ -2935,6 +2962,7 @@ func (s *Store) Capacity(ctx context.Context, useCached bool) (roachpb.StoreCapa
 	capacity.LogicalBytes = logicalBytes
 	capacity.QueriesPerSecond = totalQueriesPerSecond
 	capacity.WritesPerSecond = totalWritesPerSecond
+	capacity.ReadAmplification = s.metrics.RdbReadAmplification.Value()
 	capacity.BytesPerReplica = roachpb.PercentilesFromData(bytesPerReplica)
 	capacity.WritesPerReplica = roachpb.PercentilesFromData(writesPerReplica)
 	s.recordNewPerSecondStats(totalQueriesPerSecond, totalWritesPerSecond)
@@ -3043,8 +3071,12 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 		behindCount               int64
 
 		locks                          int64
+		totalLockHoldDurationNanos     int64
+		maxLockHoldDurationNanos       int64
 		locksWithWaitQueues            int64
 		lockWaitQueueWaiters           int64
+		totalLockWaitDurationNanos     int64
+		maxLockWaitDurationNanos       int64
 		maxLockWaitQueueWaitersForLock int64
 
 		minMaxClosedTS hlc.Timestamp
@@ -3102,10 +3134,18 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 			averageWritesPerSecond += wps
 		}
 		locks += metrics.LockTableMetrics.Locks
+		totalLockHoldDurationNanos += metrics.LockTableMetrics.TotalLockHoldDurationNanos
 		locksWithWaitQueues += metrics.LockTableMetrics.LocksWithWaitQueues
 		lockWaitQueueWaiters += metrics.LockTableMetrics.Waiters
+		totalLockWaitDurationNanos += metrics.LockTableMetrics.TotalWaitDurationNanos
 		if w := metrics.LockTableMetrics.TopKLocksByWaiters[0].Waiters; w > maxLockWaitQueueWaitersForLock {
 			maxLockWaitQueueWaitersForLock = w
+		}
+		if w := metrics.LockTableMetrics.TopKLocksByHoldDuration[0].HoldDurationNanos; w > maxLockHoldDurationNanos {
+			maxLockHoldDurationNanos = w
+		}
+		if w := metrics.LockTableMetrics.TopKLocksByWaitDuration[0].MaxWaitDurationNanos; w > maxLockWaitDurationNanos {
+			maxLockWaitDurationNanos = w
 		}
 		mc := rep.GetClosedTimestamp(ctx)
 		if minMaxClosedTS.IsEmpty() || mc.Less(minMaxClosedTS) {
@@ -3131,9 +3171,22 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.OverReplicatedRangeCount.Update(overreplicatedRangeCount)
 	s.metrics.RaftLogFollowerBehindCount.Update(behindCount)
 
+	var averageLockHoldDurationNanos int64
+	var averageLockWaitDurationNanos int64
+	if locks > 0 {
+		averageLockHoldDurationNanos = totalLockHoldDurationNanos / locks
+	}
+	if lockWaitQueueWaiters > 0 {
+		averageLockWaitDurationNanos = totalLockWaitDurationNanos / lockWaitQueueWaiters
+	}
+
 	s.metrics.Locks.Update(locks)
+	s.metrics.AverageLockHoldDurationNanos.Update(averageLockHoldDurationNanos)
+	s.metrics.MaxLockHoldDurationNanos.Update(maxLockHoldDurationNanos)
 	s.metrics.LocksWithWaitQueues.Update(locksWithWaitQueues)
 	s.metrics.LockWaitQueueWaiters.Update(lockWaitQueueWaiters)
+	s.metrics.AverageLockWaitDurationNanos.Update(averageLockWaitDurationNanos)
+	s.metrics.MaxLockWaitDurationNanos.Update(maxLockWaitDurationNanos)
 	s.metrics.MaxLockWaitQueueWaitersForLock.Update(maxLockWaitQueueWaitersForLock)
 
 	if !minMaxClosedTS.IsEmpty() {
@@ -3265,7 +3318,8 @@ func (s *Store) AllocatorDryRun(ctx context.Context, repl *Replica) (tracing.Rec
 	defer collectAndFinish()
 	canTransferLease := func(ctx context.Context, repl *Replica) bool { return true }
 	_, err := s.replicateQueue.processOneChange(
-		ctx, repl, canTransferLease, true /* dryRun */)
+		ctx, repl, canTransferLease, false /* scatter */, true, /* dryRun */
+	)
 	if err != nil {
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)
 	}
@@ -3441,6 +3495,41 @@ func (s *Store) unregisterLeaseholderByID(ctx context.Context, rangeID roachpb.R
 // tracking.
 func (s *Store) getRootMemoryMonitorForKV() *mon.BytesMonitor {
 	return s.cfg.KVMemoryMonitor
+}
+
+// Implementation of the storeForTruncator interface.
+type storeForTruncatorImpl Store
+
+var _ storeForTruncator = &storeForTruncatorImpl{}
+
+func (s *storeForTruncatorImpl) acquireReplicaForTruncator(
+	rangeID roachpb.RangeID,
+) replicaForTruncator {
+	r, err := (*Store)(s).GetReplica(rangeID)
+	if err != nil || r == nil {
+		// The only error we can see here is roachpb.NewRangeNotFoundError, so we
+		// can ignore it.
+		return nil
+	}
+	r.raftMu.Lock()
+	if isAlive := func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.mu.destroyStatus.IsAlive()
+	}(); !isAlive {
+		r.raftMu.Unlock()
+		return nil
+	}
+	return (*raftTruncatorReplica)(r)
+}
+
+func (s *storeForTruncatorImpl) releaseReplicaForTruncator(r replicaForTruncator) {
+	replica := r.(*raftTruncatorReplica)
+	replica.raftMu.Unlock()
+}
+
+func (s *storeForTruncatorImpl) getEngine() storage.Engine {
+	return (*Store)(s).engine
 }
 
 // WriteClusterVersion writes the given cluster version to the store-local

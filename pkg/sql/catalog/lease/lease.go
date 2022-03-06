@@ -123,7 +123,8 @@ func (m *Manager) WaitForOneVersion(
 ) (desc catalog.Descriptor, _ error) {
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
 		if err := m.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			desc, err = catkv.MustGetDescriptorByID(ctx, txn, m.Codec(), id, catalog.Any)
+			version := m.storage.settings.Version.ActiveVersion(ctx)
+			desc, err = catkv.MustGetDescriptorByID(ctx, txn, m.Codec(), version, id, catalog.Any)
 			return err
 		}); err != nil {
 			return nil, err
@@ -475,11 +476,8 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		// of the first context cancels other callers to the `acquireNodeLease()` method,
 		// because of its use of `singleflight.Group`. See issue #41780 for how this has
 		// happened.
-		baseCtx := m.ambientCtx.AnnotateCtx(context.Background())
-		// AddTags and not WithTags, so that we combine the tags with those
-		// filled by AnnotateCtx.
-		baseCtx = logtags.AddTags(baseCtx, logtags.FromContext(ctx))
-		newCtx, cancel := m.stopper.WithCancelOnQuiesce(baseCtx)
+		lt := logtags.FromContext(ctx)
+		ctx, cancel := m.stopper.WithCancelOnQuiesce(logtags.AddTags(m.ambientCtx.AnnotateCtx(context.Background()), lt))
 		defer cancel()
 		if m.isDraining() {
 			return nil, errors.New("cannot acquire lease when draining")
@@ -489,7 +487,7 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		if newest != nil {
 			minExpiration = newest.getExpiration()
 		}
-		desc, expiration, err := m.storage.acquire(newCtx, minExpiration, id)
+		desc, expiration, err := m.storage.acquire(ctx, minExpiration, id)
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +496,7 @@ func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, erro
 		t.mu.takenOffline = false
 		defer t.mu.Unlock()
 		var newDescVersionState *descriptorVersionState
-		newDescVersionState, toRelease, err = t.upsertLeaseLocked(newCtx, desc, expiration)
+		newDescVersionState, toRelease, err = t.upsertLeaseLocked(ctx, desc, expiration)
 		if err != nil {
 			return nil, err
 		}

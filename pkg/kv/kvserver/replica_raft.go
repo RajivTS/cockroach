@@ -17,9 +17,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/apply"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/poison"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
@@ -37,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"go.etcd.io/etcd/raft/v3/tracker"
@@ -107,7 +110,7 @@ func (r *Replica) evalAndPropose(
 ) (chan proposalResult, func(), kvserverbase.CmdIDKey, *roachpb.Error) {
 	defer tok.DoneIfNotMoved(ctx)
 	idKey := makeIDKey()
-	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, ui, g.LatchSpans())
+	proposal, pErr := r.requestToProposal(ctx, idKey, ba, st, ui, g)
 	log.Event(proposal.ctx, "evaluated request")
 
 	// If the request hit a server-side concurrency retry error, immediately
@@ -332,28 +335,52 @@ func (r *Replica) propose(
 		log.Infof(p.ctx, "proposing %s", crt)
 		prefix = false
 
-		// Ensure that we aren't trying to remove ourselves from the range without
-		// having previously given up our lease, since the range won't be able
-		// to make progress while the lease is owned by a removed replica (and
-		// leases can stay in such a state for a very long time when using epoch-
-		// based range leases). This shouldn't happen often, but has been seen
-		// before (#12591).
+		// The following deals with removing a leaseholder. A voter can be removed
+		// in two ways. 1) Simple (old style) where there is a reconfiguration
+		// turning a voter into a LEARNER / NON-VOTER. 2) Through an intermediate
+		// joint configuration, where the replica remains in the descriptor, but
+		// as VOTER_{OUTGOING, DEMOTING}. When leaving the JOINT config (a second
+		// Raft operation), the removed replica transitions a LEARNER / NON-VOTER.
 		//
-		// Note that due to atomic replication changes, when a removal is initiated,
-		// the replica remains in the descriptor, but as VOTER_{OUTGOING,DEMOTING}.
-		// We want to block it from getting into that state in the first place,
-		// since there's no stopping the actual removal/demotion once it's there.
-		// IsVoterNewConfig checks that the leaseholder is a voter in the
-		// proposed configuration.
+		// In case (1) the lease needs to be transferred out before a removal is
+		// proposed (cooperative transfer). The code below permits leaseholder
+		// removal only if entering a joint configuration (option 2 above) in which
+		// the leaseholder is (any kind of) voter. In this case, the lease is
+		// transferred to a different voter (potentially incoming) in
+		// maybeLeaveAtomicChangeReplicas right before we exit the joint
+		// configuration.
+		//
+		// When the leaseholder is replaced by a new replica, transferring the
+		// lease in the joint config allows transferring directly from old to new,
+		// since both are active in the joint config, without going through a third
+		// node or adding the new node before transferring, which might reduce
+		// fault tolerance. For example, consider v1 in region1 (leaseholder), v2
+		// in region2 and v3 in region3. We want to relocate v1 to a new node v4 in
+		// region1. We add v4 as LEARNER. At this point we can't transfer the lease
+		// to v4, so we could transfer it to v2 first, but this is likely to hurt
+		// application performance. We could instead add v4 as VOTER first, and
+		// then transfer lease directly to v4, but this would change the number of
+		// replicas to 4, and if region1 goes down, we loose a quorum. Instead,
+		// we move to a joint config where v1 (VOTER_DEMOTING_LEARNER) transfer the
+		// lease to v4 (VOTER_INCOMING) directly.
+		// See also https://github.com/cockroachdb/cockroach/issues/67740.
 		replID := r.ReplicaID()
 		rDesc, ok := p.command.ReplicatedEvalResult.State.Desc.GetReplicaDescriptorByID(replID)
-		for !ok || !rDesc.IsVoterNewConfig() {
-			if rDesc.ReplicaID == replID {
-				err := errors.Mark(errors.Newf("received invalid ChangeReplicasTrigger %s to remove self (leaseholder)", crt),
-					errMarkInvalidReplicationChange)
-				log.Errorf(p.ctx, "%v", err)
-				return roachpb.NewError(err)
-			}
+		lhRemovalAllowed := r.store.cfg.Settings.Version.IsActive(ctx,
+			clusterversion.EnableLeaseHolderRemoval)
+		// Previously, we were not allowed to enter a joint config where the
+		// leaseholder is being removed (i.e., not a voter). In the new version
+		// we're allowed to enter such a joint config, but not to exit it in this
+		// state, i.e., the leaseholder must be some kind of voter in the next
+		// new config (potentially VOTER_DEMOTING).
+		if !ok ||
+			(lhRemovalAllowed && !rDesc.IsAnyVoter()) ||
+			(!lhRemovalAllowed && !rDesc.IsVoterNewConfig()) {
+			err := errors.Mark(errors.Newf("received invalid ChangeReplicasTrigger %s to remove self ("+
+				"leaseholder); lhRemovalAllowed: %v", crt, lhRemovalAllowed),
+				errMarkInvalidReplicationChange)
+			log.Errorf(p.ctx, "%v", err)
+			return roachpb.NewError(err)
 		}
 	} else if p.command.ReplicatedEvalResult.AddSSTable != nil {
 		log.VEvent(p.ctx, 4, "sideloadable proposal detected")
@@ -868,7 +895,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		r.mu.leaderID = leaderID
 		// Clear the remote proposal set. Would have been nil already if not
 		// previously the leader.
-		becameLeader = r.mu.leaderID == r.mu.replicaID
+		becameLeader = r.mu.leaderID == r.replicaID
 	}
 	r.mu.Unlock()
 
@@ -998,7 +1025,7 @@ func maybeFatalOnRaftReadyErr(ctx context.Context, expl string, err error) (remo
 	case errors.Is(err, apply.ErrRemoved):
 		return true
 	default:
-		log.FatalfDepth(ctx, 1, "%s: %+v", log.Safe(expl), err)
+		log.FatalfDepth(ctx, 1, "%s: %+v", redact.Safe(expl), err)
 		panic("unreachable")
 	}
 }
@@ -1040,8 +1067,8 @@ func (r *Replica) tick(ctx context.Context, livenessMap liveness.IsLiveMap) (boo
 	// into the local Raft group. The leader won't hit that path, so we update
 	// it whenever it ticks. In effect, this makes sure it always sees itself as
 	// alive.
-	if r.mu.replicaID == r.mu.leaderID {
-		r.mu.lastUpdateTimes.update(r.mu.replicaID, timeutil.Now())
+	if r.replicaID == r.mu.leaderID {
+		r.mu.lastUpdateTimes.update(r.replicaID, timeutil.Now())
 	}
 
 	r.mu.ticks++
@@ -1128,6 +1155,7 @@ func (r *Replica) refreshProposalsLocked(
 	}
 
 	var maxSlowProposalDurationRequest *roachpb.BatchRequest
+	// TODO(tbg): don't track exempt requests for tripping the breaker?
 	var maxSlowProposalDuration time.Duration
 	var slowProposalCount int64
 	var reproposals pendingCmdSlice
@@ -1193,7 +1221,12 @@ func (r *Replica) refreshProposalsLocked(
 	// which could avoid build-up of raft log entries during outages, see
 	// for example:
 	// https://github.com/cockroachdb/cockroach/issues/60612
-	if r.breaker.Signal().Err() == nil && maxSlowProposalDuration > 0 {
+	//
+	// NB: the call to Err() here also re-triggers the probe if the breaker is
+	// already tripped and no probe is running, thus ensuring that even if a
+	// request got added in while the probe was about to shut down, there will
+	// be regular attempts at healing the breaker.
+	if maxSlowProposalDuration > 0 && r.breaker.Signal().Err() == nil {
 		log.Warningf(ctx,
 			"have been waiting %.2fs for slow proposal %s",
 			maxSlowProposalDuration.Seconds(), maxSlowProposalDurationRequest,
@@ -1226,6 +1259,23 @@ func (r *Replica) refreshProposalsLocked(
 			p.finishApplication(ctx, proposalResult{
 				Err: roachpb.NewError(roachpb.NewAmbiguousResultError(err.Error())),
 			})
+		}
+	}
+}
+
+func (r *Replica) poisonInflightLatches(err error) {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.mu.proposals {
+		p.ec.poison()
+		if p.ec.g.Req.PoisonPolicy == poison.Policy_Error {
+			aErr := roachpb.NewAmbiguousResultError("circuit breaker tripped")
+			aErr.WrappedErr = roachpb.NewError(err)
+			// NB: this does not release the request's latches. It's important that
+			// the latches stay in place, since the command could still apply.
+			p.signalProposalResult(proposalResult{Err: roachpb.NewError(aErr)})
 		}
 	}
 }
@@ -1585,7 +1635,7 @@ func (r *Replica) withRaftGroupLocked(
 		ctx := r.AnnotateCtx(context.TODO())
 		raftGroup, err := raft.NewRawNode(newRaftConfig(
 			raft.Storage((*replicaRaftStorage)(r)),
-			uint64(r.mu.replicaID),
+			uint64(r.replicaID),
 			r.mu.state.RaftAppliedIndex,
 			r.store.cfg,
 			&raftLogger{ctx: ctx},
@@ -1709,7 +1759,7 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 	// method were to be called on an uninitialized replica (which
 	// has no state and thus an empty raft config), this might cause
 	// problems.
-	if _, currentMember := r.mu.state.Desc.GetReplicaDescriptorByID(r.mu.replicaID); !currentMember {
+	if _, currentMember := r.mu.state.Desc.GetReplicaDescriptorByID(r.replicaID); !currentMember {
 		return
 	}
 
@@ -1999,9 +2049,9 @@ func ComputeRaftLogSize(
 	var totalSideloaded int64
 	if sideloaded != nil {
 		var err error
-		// Truncating all indexes strictly smaller than zero is a no-op but
-		// gives us the number of bytes in the storage back.
-		_, totalSideloaded, err = sideloaded.TruncateTo(ctx, 0)
+		// The remaining bytes if one were to truncate [0, 0) gives us the total
+		// number of bytes in sideloaded files.
+		_, totalSideloaded, err = sideloaded.BytesIfTruncatedFromTo(ctx, 0, 0)
 		if err != nil {
 			return 0, err
 		}

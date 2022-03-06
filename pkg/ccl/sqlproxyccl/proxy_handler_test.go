@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvtenantccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/denylist"
-	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenant"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/tenantdirsvr"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -610,6 +609,9 @@ func TestDenylistUpdate(t *testing.T) {
 
 func TestDirectoryConnect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	// TODO(jaylim-crl): This is a potential port reuse issue, so skip this
+	// under stress. See linked GitHub issue.
+	skip.UnderStress(t, "https://github.com/cockroachdb/cockroach/issues/76839")
 	skip.UnderDeadlockWithIssue(t, 71365)
 	defer log.Scope(t).Close(t)
 
@@ -670,7 +672,7 @@ func TestDirectoryConnect(t *testing.T) {
 		// Ensure that Directory.ReportFailure is being called correctly.
 		countReports := 0
 		defer testutils.TestingHook(&reportFailureToDirectory, func(
-			ctx context.Context, tenantID roachpb.TenantID, addr string, directory *tenant.Directory,
+			ctx context.Context, tenantID roachpb.TenantID, addr string, directory TenantResolver,
 		) error {
 			require.Equal(t, roachpb.MakeTenantID(28), tenantID)
 			addrs, err := directory.LookupTenantAddrs(ctx, tenantID)

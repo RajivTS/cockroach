@@ -13,7 +13,6 @@ package tabledesc
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 
@@ -28,8 +27,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // ColumnDefDescs contains the non-error return values for MakeColumnDefDescs.
@@ -51,6 +50,10 @@ type ColumnDefDescs struct {
 	// dependencies.
 	DefaultExpr, OnUpdateExpr tree.TypedExpr
 }
+
+// MaxBucketAllowed is the maximum number of buckets allowed when creating a
+// hash-sharded index or primary key.
+const MaxBucketAllowed = 2048
 
 // ForEachTypedExpr iterates over each typed expression in this struct.
 func (cdd *ColumnDefDescs) ForEachTypedExpr(fn func(tree.TypedExpr) error) error {
@@ -239,7 +242,7 @@ func EvalShardBucketCount(
 	}
 
 	var buckets int64
-	const invalidBucketCountMsg = `BUCKET_COUNT must be a 32-bit integer greater than 1, got %v`
+	const invalidBucketCountMsg = `hash sharded index bucket count must be in range [2, 2048], got %v`
 	// If shardBuckets is not specified, use default bucket count from cluster setting.
 	if legacyBucketNotGiven && paramVal == nil {
 		buckets = catconstants.DefaultHashShardedIndexBucketCount.Get(&evalCtx.Settings.SV)
@@ -262,7 +265,7 @@ func EvalShardBucketCount(
 	if buckets < 2 {
 		return 0, pgerror.Newf(pgcode.InvalidParameterValue, invalidBucketCountMsg, buckets)
 	}
-	if buckets > math.MaxInt32 {
+	if buckets > MaxBucketAllowed {
 		return 0, pgerror.Newf(pgcode.InvalidParameterValue, invalidBucketCountMsg, buckets)
 	}
 	return int32(buckets), nil
@@ -339,7 +342,10 @@ func (desc *wrapper) collectConstraintInfo(
 					indexName = mutation.GetPrimaryKeySwap().NewPrimaryIndexName
 				}
 			}
-			detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypePK}
+			detail := descpb.ConstraintDetail{
+				Kind:         descpb.ConstraintTypePK,
+				ConstraintID: index.ConstraintID,
+			}
 			detail.Columns = index.KeyColumnNames
 			detail.Index = index
 			info[indexName] = detail
@@ -348,7 +354,10 @@ func (desc *wrapper) collectConstraintInfo(
 				return nil, pgerror.Newf(pgcode.DuplicateObject,
 					"duplicate constraint name: %q", index.Name)
 			}
-			detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeUnique}
+			detail := descpb.ConstraintDetail{
+				Kind:         descpb.ConstraintTypeUnique,
+				ConstraintID: index.ConstraintID,
+			}
 			detail.Columns = index.KeyColumnNames
 			detail.Index = index
 			info[index.Name] = detail
@@ -362,7 +371,10 @@ func (desc *wrapper) collectConstraintInfo(
 			return nil, pgerror.Newf(pgcode.DuplicateObject,
 				"duplicate constraint name: %q", uc.Name)
 		}
-		detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeUnique}
+		detail := descpb.ConstraintDetail{
+			Kind:         descpb.ConstraintTypeUnique,
+			ConstraintID: uc.ConstraintID,
+		}
 		// Constraints in the Validating state are considered Unvalidated for this
 		// purpose.
 		detail.Unvalidated = uc.Validity != descpb.ConstraintValidity_Validated
@@ -381,7 +393,10 @@ func (desc *wrapper) collectConstraintInfo(
 			return nil, pgerror.Newf(pgcode.DuplicateObject,
 				"duplicate constraint name: %q", fk.Name)
 		}
-		detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeFK}
+		detail := descpb.ConstraintDetail{
+			Kind:         descpb.ConstraintTypeFK,
+			ConstraintID: fk.ConstraintID,
+		}
 		// Constraints in the Validating state are considered Unvalidated for this
 		// purpose.
 		detail.Unvalidated = fk.Validity != descpb.ConstraintValidity_Validated
@@ -397,7 +412,7 @@ func (desc *wrapper) collectConstraintInfo(
 			if err != nil {
 				return nil, errors.NewAssertionErrorWithWrappedErrf(err,
 					"error resolving table %d referenced in foreign key",
-					log.Safe(fk.ReferencedTableID))
+					redact.Safe(fk.ReferencedTableID))
 			}
 			referencedColumnNames, err := other.NamesForColumnIDs(fk.ReferencedColumnIDs)
 			if err != nil {
@@ -414,7 +429,10 @@ func (desc *wrapper) collectConstraintInfo(
 			return nil, pgerror.Newf(pgcode.DuplicateObject,
 				"duplicate constraint name: %q", c.Name)
 		}
-		detail := descpb.ConstraintDetail{Kind: descpb.ConstraintTypeCheck}
+		detail := descpb.ConstraintDetail{
+			Kind:         descpb.ConstraintTypeCheck,
+			ConstraintID: c.ConstraintID,
+		}
 		// Constraints in the Validating state are considered Unvalidated for this
 		// purpose.
 		detail.Unvalidated = c.Validity != descpb.ConstraintValidity_Validated
@@ -430,7 +448,7 @@ func (desc *wrapper) collectConstraintInfo(
 				col, err := desc.FindColumnWithID(colID)
 				if err != nil {
 					return nil, errors.NewAssertionErrorWithWrappedErrf(err,
-						"error finding column %d in table %s", log.Safe(colID), desc.Name)
+						"error finding column %d in table %s", redact.Safe(colID), desc.Name)
 				}
 				detail.Columns = append(detail.Columns, col.GetName())
 			}
@@ -487,7 +505,7 @@ func InitTableDescriptor(
 	id, parentID, parentSchemaID descpb.ID,
 	name string,
 	creationTime hlc.Timestamp,
-	privileges *descpb.PrivilegeDescriptor,
+	privileges *catpb.PrivilegeDescriptor,
 	persistence tree.Persistence,
 ) Mutable {
 	return Mutable{
@@ -595,7 +613,7 @@ func PrimaryKeyString(desc catalog.TableDescriptor) string {
 	f.WriteByte(')')
 	if primaryIdx.IsSharded() {
 		f.WriteString(
-			fmt.Sprintf(" USING HASH WITH BUCKET_COUNT = %v", primaryIdx.GetSharded().ShardBuckets),
+			fmt.Sprintf(" USING HASH WITH (bucket_count=%v)", primaryIdx.GetSharded().ShardBuckets),
 		)
 	}
 	return f.CloseAndGetString()

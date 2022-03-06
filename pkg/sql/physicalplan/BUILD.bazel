@@ -25,6 +25,7 @@ go_library(
         "//pkg/sql/execinfrapb",
         "//pkg/sql/physicalplan/replicaoracle",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treebin",
         "//pkg/sql/types",
         "//pkg/util",
         "//pkg/util/log",
@@ -45,6 +46,7 @@ go_test(
         "span_resolver_test.go",
     ],
     embed = [":physicalplan"],
+    shard_count = 16,
     deps = [
         "//pkg/base",
         "//pkg/gossip",

@@ -279,9 +279,10 @@ type DistSender struct {
 	firstRangeProvider FirstRangeProvider
 	transportFactory   TransportFactory
 	rpcContext         *rpc.Context
-	nodeDialer         *nodedialer.Dialer
-	rpcRetryOptions    retry.Options
-	asyncSenderSem     *quotapool.IntPool
+	// nodeDialer allows RPC calls from the SQL layer to the KV layer.
+	nodeDialer      *nodedialer.Dialer
+	rpcRetryOptions retry.Options
+	asyncSenderSem  *quotapool.IntPool
 	// clusterID is used to verify access to enterprise features.
 	// It is copied out of the rpcContext at construction time and used in
 	// testing.
@@ -334,7 +335,8 @@ type DistSenderConfig struct {
 	nodeDescriptor  *roachpb.NodeDescriptor
 	RPCRetryOptions *retry.Options
 	RPCContext      *rpc.Context
-	NodeDialer      *nodedialer.Dialer
+	// NodeDialer is the dialer from the SQL layer to the KV layer.
+	NodeDialer *nodedialer.Dialer
 
 	// One of the following two must be provided, but not both.
 	//
@@ -607,7 +609,7 @@ func (ds *DistSender) getRoutingInfo(
 		}
 		if !containsFn(returnToken.Desc(), descKey) {
 			log.Fatalf(ctx, "programming error: range resolution returning non-matching descriptor: "+
-				"desc: %s, key: %s, reverse: %t", returnToken.Desc(), descKey, log.Safe(useReverseScan))
+				"desc: %s, key: %s, reverse: %t", returnToken.Desc(), descKey, redact.Safe(useReverseScan))
 		}
 	}
 
@@ -762,7 +764,7 @@ func (ds *DistSender) Send(
 		// We already verified above that the batch contains only scan requests of the same type.
 		// Such a batch should never need splitting.
 		log.Fatalf(ctx, "batch with MaxSpanRequestKeys=%d, TargetBytes=%d needs splitting",
-			log.Safe(ba.MaxSpanRequestKeys), log.Safe(ba.TargetBytes))
+			redact.Safe(ba.MaxSpanRequestKeys), redact.Safe(ba.TargetBytes))
 	}
 	var singleRplChunk [1]*roachpb.BatchResponse
 	rplChunks := singleRplChunk[:0:1]
@@ -2152,10 +2154,10 @@ func (ds *DistSender) sendToReplicas(
 
 					var updatedLeaseholder bool
 					if tErr.Lease != nil {
-						updatedLeaseholder = routing.UpdateLease(ctx, tErr.Lease, tErr.DescriptorGeneration)
+						updatedLeaseholder = routing.UpdateLease(ctx, tErr.Lease, tErr.RangeDesc.Generation)
 					} else if tErr.LeaseHolder != nil {
 						// tErr.LeaseHolder might be set when tErr.Lease isn't.
-						routing.UpdateLeaseholder(ctx, *tErr.LeaseHolder, tErr.DescriptorGeneration)
+						routing.UpdateLeaseholder(ctx, *tErr.LeaseHolder, tErr.RangeDesc.Generation)
 						updatedLeaseholder = true
 					}
 					// Move the new leaseholder to the head of the queue for the next

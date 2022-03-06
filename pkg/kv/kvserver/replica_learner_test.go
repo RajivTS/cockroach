@@ -312,6 +312,7 @@ func TestLearnerSnapshotFailsRollback(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderShort(t) // Takes 90s.
+	skip.UnderRace(t)
 
 	runTest := func(t *testing.T, replicaType roachpb.ReplicaType) {
 		var rejectSnapshots int64
@@ -1195,7 +1196,7 @@ func TestMergeQueueSeesLearnerOrJointConfig(t *testing.T) {
 		require.False(t, desc.Replicas().InAtomicReplicationChange(), desc)
 
 		// Repeat the game, except now we start with two replicas and we're
-		// giving the RHS a VOTER_OUTGOING.
+		// giving the RHS a VOTER_DEMOTING_LEARNER.
 		desc = splitAndUnsplit()
 		ltk.withStopAfterJointConfig(func() {
 			descRight := tc.RemoveVotersOrFatal(t, desc.EndKey.AsRawKey(), tc.Target(1))

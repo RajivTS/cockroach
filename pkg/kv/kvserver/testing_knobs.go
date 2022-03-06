@@ -11,6 +11,7 @@
 package kvserver
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -77,6 +78,10 @@ type StoreTestingKnobs struct {
 	// It is only called on the replica the proposed the command.
 	TestingPostApplyFilter kvserverbase.ReplicaApplyFilter
 
+	// TestingResponseErrorEvent is called when an error is returned applying
+	// a command.
+	TestingResponseErrorEvent func(context.Context, *roachpb.BatchRequest, error)
+
 	// TestingResponseFilter is called after the replica processes a
 	// command in order for unittests to modify the batch response,
 	// error returned to the client, or to simulate network failures.
@@ -85,10 +90,6 @@ type StoreTestingKnobs struct {
 	// SlowReplicationThresholdOverride is an interceptor that allows setting a
 	// per-Batch SlowReplicationThreshold.
 	SlowReplicationThresholdOverride func(ba *roachpb.BatchRequest) time.Duration
-
-	// CancelStorageFactory overrides the default CancelStorage used by Replica
-	// circuit breakers.
-	CancelStorageFactory func() CancelStorage
 
 	// TestingRangefeedFilter is called before a replica processes a rangefeed
 	// in order for unit tests to modify the request, error returned to the client

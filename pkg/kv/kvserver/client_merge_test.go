@@ -417,6 +417,7 @@ func TestStoreRangeMergeTimestampCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	skip.UnderShort(t)
+	skip.UnderRace(t)
 
 	testutils.RunTrueAndFalse(t, "disjoint-leaseholders", func(t *testing.T, disjointLeaseholders bool) {
 		testutils.RunTrueAndFalse(t, "through-snapshot", func(t *testing.T, throughSnapshot bool) {
@@ -741,6 +742,9 @@ func mergeCheckingTimestampCaches(
 			// the result to apply on the majority quorum.
 			testutils.SucceedsSoon(t, func() error {
 				for _, r := range lhsRepls[1:] {
+					// Loosely-coupled truncation requires an engine flush to advance
+					// guaranteed durability.
+					require.NoError(t, r.Engine().Flush())
 					firstIndex, err := r.GetFirstIndex()
 					require.NoError(t, err)
 					if firstIndex < truncIndex {
@@ -3789,9 +3793,11 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		defer it.Close()
 		// Write a range deletion tombstone to each of the SSTs then put in the
 		// kv entries from the sender of the snapshot.
+		ctx := context.Background()
+		st := cluster.MakeTestingClusterSettings()
 		for _, r := range keyRanges {
 			sstFile := &storage.MemFile{}
-			sst := storage.MakeIngestionSSTWriter(sstFile)
+			sst := storage.MakeIngestionSSTWriter(ctx, st, sstFile)
 			if err := sst.ClearRawRange(r.Start, r.End); err != nil {
 				return err
 			}
@@ -3828,7 +3834,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		for _, k := range []roachpb.Key{keyB, keyC} {
 			rangeID := rangeIds[string(k)]
 			sstFile := &storage.MemFile{}
-			sst := storage.MakeIngestionSSTWriter(sstFile)
+			sst := storage.MakeIngestionSSTWriter(ctx, st, sstFile)
 			defer sst.Close()
 			r := rditer.MakeRangeIDLocalKeyRange(rangeID, false /* replicatedOnly */)
 			if err := sst.ClearRawRange(r.Start, r.End); err != nil {
@@ -3848,7 +3854,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 
 		// Construct an SST for the user key range of the subsumed replicas.
 		sstFile := &storage.MemFile{}
-		sst := storage.MakeIngestionSSTWriter(sstFile)
+		sst := storage.MakeIngestionSSTWriter(ctx, st, sstFile)
 		defer sst.Close()
 		desc := roachpb.RangeDescriptor{
 			StartKey: roachpb.RKey(keyD),
@@ -3978,6 +3984,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		if _, err := kv.SendWrapped(ctx, distSender, truncArgs); err != nil {
 			t.Fatal(err)
 		}
+		waitForTruncationForTesting(t, repl, index)
 		return index
 	}()
 
@@ -4458,6 +4465,8 @@ func TestMergeQueue(t *testing.T) {
 func TestMergeQueueSeesNonVoters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t)
 
 	type test struct {
 		name                                                   string
